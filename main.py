@@ -21,7 +21,6 @@ if not all([SUPABASE_URL, SUPABASE_KEY, ODOO_URL, ODOO_DB, ODOO_USER, ODOO_PASSW
 
 # 🔗 Connexions
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
 common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
 uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
 if not uid:
@@ -50,11 +49,8 @@ def remove_duplicate_products():
     print("🧹 Suppression des doublons produits...")
 
     products = models.execute_kw(
-        ODOO_DB,
-        uid,
-        ODOO_PASSWORD,
-        "product.product",
-        "search_read",
+        ODOO_DB, uid, ODOO_PASSWORD,
+        "product.product", "search_read",
         [[["default_code", "!=", False]]],
         {"fields": ["id", "default_code"], "limit": 5000},
     )
@@ -71,11 +67,8 @@ def remove_duplicate_products():
             to_delete = ids[1:]
             try:
                 models.execute_kw(
-                    ODOO_DB,
-                    uid,
-                    ODOO_PASSWORD,
-                    "product.product",
-                    "unlink",
+                    ODOO_DB, uid, ODOO_PASSWORD,
+                    "product.product", "unlink",
                     [to_delete],
                 )
                 total_deleted += len(to_delete)
@@ -86,7 +79,7 @@ def remove_duplicate_products():
     print(f"✅ Nettoyage terminé ({total_deleted} doublons supprimés)")
 
 
-# 🔄 Création / mise à jour d’un produit
+# 🔄 Création / mise à jour d’un produit (PROPRE)
 def upsert_product(row: dict):
     package_id = row.get("airalo_id")
     name_base = row.get("name")
@@ -116,22 +109,19 @@ def upsert_product(row: dict):
 
     # Recherche produit existant
     existing = models.execute_kw(
-        ODOO_DB,
-        uid,
-        ODOO_PASSWORD,
-        "product.product",
-        "search_read",
+        ODOO_DB, uid, ODOO_PASSWORD,
+        "product.product", "search_read",
         [[["default_code", "=", package_id]]],
         {"fields": ["id", "product_tmpl_id", "image_1920"], "limit": 1},
     )
 
     image_base64 = None
 
+    # ✔️ Mise à jour
     if existing:
         prod = existing[0]
         tmpl_id = prod["product_tmpl_id"][0]
 
-        # Image : option A → uniquement si absente
         if not prod["image_1920"] and image_url:
             image_base64 = get_image_base64_from_url(image_url)
 
@@ -144,18 +134,15 @@ def upsert_product(row: dict):
             vals["image_1920"] = image_base64
 
         models.execute_kw(
-            ODOO_DB,
-            uid,
-            ODOO_PASSWORD,
-            "product.template",
-            "write",
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "product.template", "write",
             [[tmpl_id], vals],
         )
 
         print(f"🔁 Produit mis à jour : {package_id} → {name} ({price} €)")
         return
 
-    # Création
+    # ✔️ Création
     if image_url:
         image_base64 = get_image_base64_from_url(image_url)
 
@@ -172,37 +159,31 @@ def upsert_product(row: dict):
         vals["image_1920"] = image_base64
 
     product_id = models.execute_kw(
-        ODOO_DB,
-        uid,
-        ODOO_PASSWORD,
-        "product.product",
-        "create",
+        ODOO_DB, uid, ODOO_PASSWORD,
+        "product.product", "create",
         [vals],
     )
 
     print(f"✅ Produit créé : {name} ({price} €) — ID {product_id}")
 
 
-# 🟢 Sync produits
+# 🟢 Sync produits Airalo
 def sync_airalo_packages():
-    print("🚀 Sync produits...")
+    print("🚀 Sync produits Airalo...")
     packages = supabase.table("airalo_packages").select("*").execute().data
     print(f"📦 {len(packages)} packages trouvés")
 
     for row in packages:
         upsert_product(row)
 
-    print("🎉 Produits synchronisés.")
+    print("🎉 Produits Airalo synchronisés.")
 
 
 # 👤 Trouver ou créer partenaire
 def find_or_create_partner(email, full_name):
     partners = models.execute_kw(
-        ODOO_DB,
-        uid,
-        ODOO_PASSWORD,
-        "res.partner",
-        "search",
+        ODOO_DB, uid, ODOO_PASSWORD,
+        "res.partner", "search",
         [[["email", "=", email]]],
         {"limit": 1},
     )
@@ -210,11 +191,8 @@ def find_or_create_partner(email, full_name):
         return partners[0]
 
     return models.execute_kw(
-        ODOO_DB,
-        uid,
-        ODOO_PASSWORD,
-        "res.partner",
-        "create",
+        ODOO_DB, uid, ODOO_PASSWORD,
+        "res.partner", "create",
         [{"name": full_name or email, "email": email, "customer_rank": 1}],
     )
 
@@ -222,36 +200,105 @@ def find_or_create_partner(email, full_name):
 # 🛒 Trouver produit
 def find_product(package_id):
     product = models.execute_kw(
-        ODOO_DB,
-        uid,
-        ODOO_PASSWORD,
-        "product.product",
-        "search_read",
+        ODOO_DB, uid, ODOO_PASSWORD,
+        "product.product", "search_read",
         [[["default_code", "=", package_id]]],
         {"fields": ["id", "list_price"], "limit": 1},
     )
     return product[0] if product else None
 
 
-# 🟡 Sync commandes Airalo
+# 🟡 Sync commandes Airalo (corrigé)
 def sync_airalo_orders():
     print("🛒 Sync commandes Airalo...")
     rows = supabase.table("airalo_orders").select("*").execute().data
 
     for row in rows:
-        order_ref = row["order_id"]
-        email = row["email"]
-        full_name = f"{row.get('prenom', '')} {row.get('nom', '')}".strip()
-        package_id = row["package_id"]
+        # 🔐 Protection order_id
+        order_ref = row.get("order_id") or row.get("id")
+        if not order_ref:
+            print(f"⚠️ Commande ignorée (pas d'order_id) : {row}")
+            continue
+
+        email = row.get("email")
+        if not email:
+            print(f"⚠️ Pas d'email pour commande {order_ref}, ignorée")
+            continue
+
+        package_id = row.get("package_id")
+        if not package_id:
+            print(f"⚠️ Pas de package_id pour commande {order_ref}, ignorée")
+            continue
+
+        full_name = f"{row.get('prenom','')} {row.get('nom','')}".strip()
         created_at = row.get("created_at") or datetime.datetime.now().isoformat()
 
         # Déjà existante ?
         existing = models.execute_kw(
-            ODOO_DB,
-            uid,
-            ODOO_PASSWORD,
-            "sale.order",
-            "search",
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "sale.order", "search",
+            [[["client_order_ref", "=", order_ref]]],
+            {"limit": 1},
+        )
+        if existing:
+            continue
+
+        partner_id = find_or_create_partner(email, full_name)
+        product = find_product(package_id)
+        if not product:
+            print(f"❌ Produit introuvable pour commande Airalo : {package_id}")
+            continue
+
+        models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "sale.order", "create",
+            [{
+                "partner_id": partner_id,
+                "client_order_ref": order_ref,
+                "date_order": created_at,
+                "order_line": [
+                    (0, 0, {
+                        "product_id": product["id"],
+                        "product_uom_qty": 1,
+                        "price_unit": product["list_price"],
+                    })
+                ],
+            }],
+        )
+
+        print(f"🟢 Commande Airalo créée : {order_ref}")
+
+
+# 🟢 Sync commandes "standards" corrigé
+def sync_orders():
+    print("🛒 Sync commandes standard...")
+    rows = supabase.table("orders").select("*").execute().data
+
+    for row in rows:
+
+        # 🔐 Protection order_id
+        order_ref = row.get("order_id") or row.get("id")
+        if not order_ref:
+            print(f"⚠️ Commande standard ignorée (pas d'order_id) : {row}")
+            continue
+
+        email = row.get("email")
+        if not email:
+            print(f"⚠️ Pas d'email pour commande {order_ref}, ignorée")
+            continue
+
+        package_id = row.get("package_id")
+        if not package_id:
+            print(f"⚠️ Pas de package_id pour commande {order_ref}, ignorée")
+            continue
+
+        full_name = f"{row.get('prenom','')} {row.get('nom','')}".strip()
+        created_at = row.get("created_at") or datetime.datetime.now().isoformat()
+
+        # Existence ?
+        existing = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "sale.order", "search",
             [[["client_order_ref", "=", order_ref]]],
             {"limit": 1},
         )
@@ -265,72 +312,20 @@ def sync_airalo_orders():
             continue
 
         models.execute_kw(
-            ODOO_DB,
-            uid,
-            ODOO_PASSWORD,
-            "sale.order",
-            "create",
-            [
-                {
-                    "partner_id": partner_id,
-                    "client_order_ref": order_ref,
-                    "date_order": created_at,
-                    "order_line": [
-                        (0, 0, {"product_id": product["id"], "product_uom_qty": 1, "price_unit": product["list_price"]})
-                    ],
-                }
-            ],
-        )
-
-        print(f"🟢 Commande créée : {order_ref}")
-
-
-# 🟢 Sync commandes standards
-def sync_orders():
-    print("🛒 Sync commandes standard...")
-    rows = supabase.table("orders").select("*").execute().data
-
-    for row in rows:
-        order_ref = row["order_id"]
-        email = row["email"]
-        full_name = f"{row.get('prenom', '')} {row.get('nom', '')}".strip()
-        package_id = row["package_id"]
-        created_at = row.get("created_at") or datetime.datetime.now().isoformat()
-
-        existing = models.execute_kw(
-            ODOO_DB,
-            uid,
-            ODOO_PASSWORD,
-            "sale.order",
-            "search",
-            [[["client_order_ref", "=", order_ref]]],
-            {"limit": 1},
-        )
-        if existing:
-            continue
-
-        partner_id = find_or_create_partner(email, full_name)
-        product = find_product(package_id)
-        if not product:
-            print(f"❌ Produit introuvable : {package_id}")
-            continue
-
-        models.execute_kw(
-            ODOO_DB,
-            uid,
-            ODOO_PASSWORD,
-            "sale.order",
-            "create",
-            [
-                {
-                    "partner_id": partner_id,
-                    "client_order_ref": order_ref,
-                    "date_order": created_at,
-                    "order_line": [
-                        (0, 0, {"product_id": product["id"], "product_uom_qty": 1, "price_unit": product["list_price"]})
-                    ],
-                }
-            ],
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "sale.order", "create",
+            [{
+                "partner_id": partner_id,
+                "client_order_ref": order_ref,
+                "date_order": created_at,
+                "order_line": [
+                    (0, 0, {
+                        "product_id": product["id"],
+                        "product_uom_qty": 1,
+                        "price_unit": product["list_price"],
+                    })
+                ],
+            }],
         )
 
         print(f"🟢 Commande standard créée : {order_ref}")
@@ -339,8 +334,10 @@ def sync_orders():
 # 🚀 EXECUTION PRINCIPALE
 if __name__ == "__main__":
     print("🚀 Début synchronisation Supabase → Odoo")
+
     remove_duplicate_products()
     sync_airalo_packages()
     sync_airalo_orders()
     sync_orders()
+
     print("✅ Synchronisation terminée")
