@@ -17,7 +17,7 @@ print("🔎 Recherche des commandes Stripe…")
 order_ids = models.execute_kw(
     ODOO_DB, uid, ODOO_PASSWORD,
     'sale.order', 'search',
-    [[('origin', '=', 'Stripe')]]
+    [[('origin', 'ilike', 'Stripe%')]]
 )
 
 print(f"🗑 {len(order_ids)} commandes Stripe trouvées.")
