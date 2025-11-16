@@ -1,15 +1,10 @@
 import os
 import xmlrpc.client
 
-# Variables d'environnement
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
 ODOO_USER = os.getenv("ODOO_USER")
 ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
-
-if not all([ODOO_URL, ODOO_DB, ODOO_USER, ODOO_PASSWORD]):
-    print("❌ Variables d'environnement Odoo manquantes.")
-    exit(1)
 
 print("🔌 Connexion à Odoo…")
 
