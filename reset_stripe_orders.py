@@ -1,31 +1,27 @@
-import os
-import xmlrpc.client
+name: Reset Stripe Orders
 
-ODOO_URL = os.getenv("ODOO_URL")
-ODOO_DB = os.getenv("ODOO_DB")
-ODOO_USER = os.getenv("ODOO_USER")
-ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
+on:
+  workflow_dispatch:
 
-common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
-uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
-models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+jobs:
+  reset:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-print("🔎 Recherche des commandes Stripe…")
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
 
-order_ids = models.execute_kw(
-    ODOO_DB, uid, ODOO_PASSWORD,
-    'sale.order', 'search',
-    [[('origin', '=', 'Stripe')]]
-)
+      - name: Install dependencies
+        run: pip install python-dotenv
 
-print(f"🗑 {len(order_ids)} commandes Stripe trouvées.")
-
-if order_ids:
-    models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        'sale.order', 'unlink',
-        [order_ids]
-    )
-    print("✅ Commandes Stripe supprimées.")
-else:
-    print("ℹ️ Aucune commande Stripe à supprimer.")
+      - name: Run reset script
+        env:
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_USER: ${{ secrets.ODOO_USER }}
+          ODOO_PASSWORD: ${{ secrets.ODOO_PASSWORD }}
+        run: python reset_stripe_orders.py
