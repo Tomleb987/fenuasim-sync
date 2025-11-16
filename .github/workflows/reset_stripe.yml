@@ -14,10 +14,10 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install xmlrpc.client python-dotenv
+        run: pip install python-dotenv
 
       - name: Run reset script
         env:
