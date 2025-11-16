@@ -20,7 +20,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install supabase python-dotenv requests xmlrpc
+          pip install supabase python-dotenv requests
           pip list
 
       - name: Run fast order & payment sync
