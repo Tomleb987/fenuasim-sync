@@ -1,16 +1,15 @@
 import os
-import base64
-import requests
+import sys
+import time
+import datetime
 import xmlrpc.client
-from supabase import create_client
-from dotenv import load_dotenv
-from datetime import datetime
 
-load_dotenv()
+from supabase import create_client, Client
 
-# -----------------------
-# CONFIG
-# -----------------------
+# ============================================================
+#  CONFIG SUPABASE & ODOO
+# ============================================================
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
@@ -19,391 +18,439 @@ ODOO_DB = os.getenv("ODOO_DB")
 ODOO_USER = os.getenv("ODOO_USER")
 ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
 
-if not all([SUPABASE_URL, SUPABASE_KEY, ODOO_URL, ODOO_DB, ODOO_USER, ODOO_PASSWORD]):
-    raise RuntimeError("❌ Variables d'environnement manquantes.")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("❌ SUPABASE_URL ou SUPABASE_KEY manquants.")
+    sys.exit(1)
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+if not all([ODOO_URL, ODOO_DB, ODOO_USER, ODOO_PASSWORD]):
+    print("❌ Paramètres Odoo manquants (ODOO_URL / ODOO_DB / ODOO_USER / ODOO_PASSWORD).")
+    sys.exit(1)
 
-common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Connexion Odoo
+common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common", allow_none=True)
 uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
 if not uid:
-    raise RuntimeError("❌ Authentification Odoo échouée")
+    print("❌ Impossible de s'authentifier sur Odoo.")
+    sys.exit(1)
 
-models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object", allow_none=True)
 
-
-# -----------------------
-# UTILS
-# -----------------------
-def normalize_date(date_value):
-    """Normalise une date ISO en format Odoo '%Y-%m-%d %H:%M:%S'."""
-    if not date_value:
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        dt = datetime.fromisoformat(str(date_value).replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+ESIM_CATEGORY_ID = None  # cache global pour la catégorie produit eSIM
 
 
-def find_or_create_partner(email, name=None):
-    """Trouve ou crée un partenaire Odoo à partir de l'email."""
-    if not email:
-        raise ValueError("Email manquant pour find_or_create_partner")
+# ============================================================
+#  HELPERS ODOO
+# ============================================================
 
-    partners = models.execute_kw(
-        ODOO_DB,
-        uid,
-        ODOO_PASSWORD,
-        "res.partner",
-        "search_read",
-        [[["email", "=", email]]],
-        {"fields": ["id", "name"], "limit": 1},
+def get_or_create_esim_category():
+    """Retourne l'ID de la catégorie produit 'Forfaits eSIM', la crée si besoin."""
+    global ESIM_CATEGORY_ID
+    if ESIM_CATEGORY_ID:
+        return ESIM_CATEGORY_ID
+
+    # Chercher la catégorie existante
+    cat_ids = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'product.category', 'search',
+        [[('name', '=', 'Forfaits eSIM')]],
+        {'limit': 1}
     )
-    if partners:
-        return partners[0]["id"]
+    if cat_ids:
+        ESIM_CATEGORY_ID = cat_ids[0]
+        return ESIM_CATEGORY_ID
+
+    # Chercher le compte 706100 (facultatif si non trouvé)
+    income_account_id = False
+    try:
+        acc_ids = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'account.account', 'search',
+            [[('code', '=', '706100')]],
+            {'limit': 1}
+        )
+        if acc_ids:
+            income_account_id = acc_ids[0]
+    except Exception:
+        income_account_id = False
+
+    vals = {
+        'name': 'Forfaits eSIM',
+    }
+    if income_account_id:
+        vals['property_account_income_categ_id'] = income_account_id
+
+    cat_id = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'product.category', 'create',
+        [vals]
+    )
+    ESIM_CATEGORY_ID = cat_id
+    print(f"🆕 Catégorie produit créée : Forfaits eSIM (ID {cat_id})")
+    return ESIM_CATEGORY_ID
+
+
+def ensure_partner(email, first_name=None, last_name=None):
+    """Retourne l'ID du partenaire Odoo (res.partner), le crée si nécessaire."""
+    if not email:
+        email = "inconnu@fenuasim.com"
+
+    partner_ids = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'res.partner', 'search',
+        [[('email', '=', email)]],
+        {'limit': 1}
+    )
+    if partner_ids:
+        return partner_ids[0]
+
+    if first_name or last_name:
+        name = f"{first_name or ''} {last_name or ''}".strip()
+    else:
+        name = email
 
     partner_id = models.execute_kw(
-        ODOO_DB,
-        uid,
-        ODOO_PASSWORD,
-        "res.partner",
-        "create",
-        [
-            {
-                "name": name or email,
-                "email": email,
-                "customer_rank": 1,
-            }
-        ],
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'res.partner', 'create',
+        [{
+            'name': name,
+            'email': email,
+        }]
     )
-    print(f"🆕 Partenaire créé : {email} (ID {partner_id})")
+    print(f"🆕 Partner créé : {email} (ID {partner_id})")
     return partner_id
 
 
-def get_income_account_706100():
-    """Retourne l'ID du compte 706100 s'il existe."""
-    account_ids = models.execute_kw(
-        ODOO_DB,
-        uid,
-        ODOO_PASSWORD,
-        "account.account",
-        "search",
-        [[["code", "=", "706100"]]],
-        {"limit": 1},
+def get_or_create_product_for_order(row):
+    """
+    Crée / récupère un produit Odoo à partir d'une ligne Stripe (table orders).
+    Clé = package_id (Option A).
+    """
+    package_id = row.get('package_id')
+    package_name = row.get('package_name') or "Forfait eSIM"
+    data_amount = row.get('data_amount')
+    data_unit = row.get('data_unit')
+    validity = row.get('validity')
+
+    if not package_id:
+        # fallback très rare
+        package_id = f"ESIM-{data_amount or ''}{data_unit or ''}-{validity or ''}j"
+
+    # Chercher produit par code interne = package_id
+    product_ids = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'product.product', 'search',
+        [[('default_code', '=', package_id)]],
+        {'limit': 1}
     )
-    if account_ids:
-        return account_ids[0]
-    print("⚠️ Compte 706100 introuvable dans Odoo, le produit sera créé sans compte dédié.")
+    if product_ids:
+        return product_ids[0]
+
+    # Création du produit
+    categ_id = get_or_create_esim_category()
+
+    # Prix : priorité à field "price", sinon amount/100
+    price = row.get('price')
+    if price is None:
+        amount = row.get('amount') or 0
+        price = float(amount) / 100.0
+    else:
+        price = float(price)
+
+    # Nom lisible
+    label_parts = []
+    if data_amount and data_unit:
+        label_parts.append(f"{data_amount} {data_unit}")
+    if validity:
+        label_parts.append(f"{validity} jours")
+    label = " - ".join(label_parts) if label_parts else package_name
+
+    vals = {
+        'name': f"{label}",
+        'default_code': package_id,
+        'type': 'service',
+        'detailed_type': 'service',
+        'list_price': price,
+        'categ_id': categ_id,
+        'taxes_id': [(6, 0, [])],  # Pas de TVA
+    }
+
+    product_id = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'product.product', 'create',
+        [vals]
+    )
+    print(f"🆕 Produit créé automatiquement : {label} (ID {product_id}, code {package_id})")
+    return product_id
+
+
+def find_odoo_order_by_stripe_ref(stripe_session_id):
+    """Recherche une commande Odoo liée à une session Stripe (client_order_ref)."""
+    if not stripe_session_id:
+        return None
+
+    order_ids = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'sale.order', 'search',
+        [[('client_order_ref', '=', stripe_session_id)]],
+        {'limit': 1}
+    )
+    if order_ids:
+        return order_ids[0]
     return None
 
 
-def get_or_create_category_forfaits():
-    """Retourne ou crée la catégorie produit 'Forfaits eSIM'."""
-    categ = models.execute_kw(
-        ODOO_DB,
-        uid,
-        ODOO_PASSWORD,
-        "product.category",
-        "search_read",
-        [[["name", "=", "Forfaits eSIM"]]],
-        {"fields": ["id"], "limit": 1},
-    )
-    if categ:
-        return categ[0]["id"]
-
-    categ_id = models.execute_kw(
-        ODOO_DB,
-        uid,
-        ODOO_PASSWORD,
-        "product.category",
-        "create",
-        [{"name": "Forfaits eSIM"}],
-    )
-    print(f"🆕 Catégorie produit créée : Forfaits eSIM (ID {categ_id})")
-    return categ_id
-
-
-def get_or_create_product(package_id, package_name=None, price=0.0,
-                          data_amount=None, data_unit=None, validity_days=None):
+def ensure_order_has_line(order_id, product_id, row):
     """
-    Trouve ou crée un produit Odoo à partir du package_id (Airalo ID).
-    - Affecte le compte 706100
-    - Met la catégorie 'Forfaits eSIM'
-    - Type service
+    S'assure que la sale.order a au moins une ligne avec un produit.
+    Si aucune ligne / aucune ligne avec product_id => on ajoute une ligne.
     """
-    if not package_id:
-        raise ValueError("package_id manquant pour get_or_create_product")
-
-    # 1) Cherche d'abord un produit existant
-    product = models.execute_kw(
-        ODOO_DB,
-        uid,
-        ODOO_PASSWORD,
-        "product.product",
-        "search_read",
-        [[["default_code", "=", package_id]]],
-        {"fields": ["id", "name", "list_price"], "limit": 1},
-    )
-    if product:
-        return product[0]["id"], product[0]["name"]
-
-    # 2) Sinon, on le crée
-    account_id = get_income_account_706100()
-    categ_id = get_or_create_category_forfaits()
-
-    # Construction d'un nom lisible
-    base_name = package_name or package_id
-    details = []
-
-    if data_amount and data_unit:
-        details.append(f"{data_amount} {data_unit}")
-    if validity_days:
-        details.append(f"{validity_days} jours")
-
-    if details:
-        full_name = f"{base_name} - " + " / ".join(details)
+    # Prix
+    price = row.get('price')
+    if price is None:
+        amount = row.get('amount') or 0
+        price = float(amount) / 100.0
     else:
-        full_name = base_name
+        price = float(price)
 
-    vals = {
-        "name": full_name,
-        "default_code": package_id,
-        "list_price": float(price or 0.0),
-        "type": "service",
-        "sale_ok": True,
-        "purchase_ok": False,
-    }
+    # Libellé de ligne
+    package_name = row.get('package_name') or "Forfait eSIM"
+    data_amount = row.get('data_amount')
+    data_unit = row.get('data_unit')
+    validity = row.get('validity')
 
-    if categ_id:
-        vals["categ_id"] = categ_id
-    if account_id:
-        # Champ propriété revenu
-        vals["property_account_income_id"] = account_id
+    line_label_parts = [package_name]
+    if data_amount and data_unit:
+        line_label_parts.append(f"{data_amount} {data_unit}")
+    if validity:
+        line_label_parts.append(f"{validity} jours")
+    line_name = " - ".join(line_label_parts)
 
-    product_id = models.execute_kw(
-        ODOO_DB,
-        uid,
-        ODOO_PASSWORD,
-        "product.product",
-        "create",
-        [vals],
+    # Lire les lignes existantes
+    order_data = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'sale.order', 'read',
+        [[order_id], ['order_line']]
+    )[0]
+    line_ids = order_data.get('order_line', [])
+
+    if line_ids:
+        # Vérifier si au moins une ligne a déjà un produit
+        lines = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'sale.order.line', 'read',
+            [line_ids, ['product_id']]
+        )
+        has_product = any(l.get('product_id') and l['product_id'][0] for l in lines)
+        if has_product:
+            # Rien à faire
+            return
+
+    # Ajouter une nouvelle ligne avec produit
+    models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'sale.order', 'write',
+        [[order_id], {
+            'order_line': [
+                (0, 0, {
+                    'product_id': product_id,
+                    'name': line_name,
+                    'product_uom_qty': 1.0,
+                    'price_unit': price,
+                })
+            ]
+        }]
     )
-    print(f"🆕 Produit créé automatiquement : {full_name} (ID {product_id}, code {package_id})")
-    return product_id, full_name
-
-
-def find_odoo_order(order_ref):
-    """Retrouve l'ID d'une sale.order à partir du client_order_ref."""
-    if not order_ref:
-        return None
-    res = models.execute_kw(
-        ODOO_DB,
-        uid,
-        ODOO_PASSWORD,
-        "sale.order",
-        "search",
-        [[["client_order_ref", "=", order_ref]]],
-        {"limit": 1},
-    )
-    return res[0] if res else None
 
 
 def confirm_order(order_id):
-    """Confirme une commande Odoo si possible (action_confirm)."""
-    if not order_id:
-        return
+    """Tente de confirmer la commande (passage du devis à la commande)."""
     try:
         models.execute_kw(
-            ODOO_DB,
-            uid,
-            ODOO_PASSWORD,
-            "sale.order",
-            "action_confirm",
-            [[order_id]],
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'sale.order', 'action_confirm',
+            [[order_id]]
         )
-        print(f"✅ Commande confirmée : {order_id}")
+        print(f"✅ Commande confirmée dans Odoo (ID {order_id})")
     except Exception as e:
-        print(f"❌ Erreur passage en payé : {e}")
+        print(f"❌ Erreur passage en payé :", e)
 
 
-# -----------------------
-# SYNC COMMANDES AIRALO (VENTES TECHNIQUES)
-# -----------------------
+# ============================================================
+#  SYNC AIRALO ORDERS (technique / info)
+# ============================================================
+
 def sync_airalo_orders():
+    """
+    Synchronisation des commandes Airalo depuis Supabase vers Odoo.
+    Ici : on crée un devis informatif par commande Airalo (sans produit),
+    surtout pour le suivi (ICCID, QR code, etc.).
+    """
     print("🔄 Sync Airalo orders…")
-    rows = supabase.table("airalo_orders").select("*").execute().data
+
+    res = supabase.table("airalo_orders").select("*").order("created_at", desc=False).execute()
+    rows = res.data or []
     print(f"📄 {len(rows)} lignes Airalo récupérées.")
 
+    created_count = 0
+
     for row in rows:
-        email = row.get("email")
-        package_id = row.get("package_id")
-        order_ref = row.get("order_id")  # ID Airalo (ex. 1134571)
-        created_at = normalize_date(row.get("created_at"))
+        order_id_airalo = row.get('order_id')
+        email = row.get('email')
+        prenom = row.get('prenom') or row.get('first_name')
+        nom = row.get('nom') or row.get('last_name')
+        iccid = row.get('sim_iccid')
+        qr_code_url = row.get('qr_code_url')
+        apple_url = row.get('apple_installation_url')
+        status = row.get('status')
+        data_balance = row.get('data_balance')
+        created_at = row.get('created_at')
 
-        if not email or not package_id or not order_ref:
-            print("⚠️ Ligne Airalo incomplète, ignorée.")
+        if not order_id_airalo:
             continue
 
-        # Si déjà en Odoo → on ne recrée pas
-        if find_odoo_order(order_ref):
+        client_order_ref = f"AIRALO-{order_id_airalo}"
+
+        # Chercher si déjà existante
+        so_id = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'sale.order', 'search',
+            [[('client_order_ref', '=', client_order_ref)]],
+            {'limit': 1}
+        )
+        if so_id:
             continue
 
-        # On garantit qu'un produit existe pour ce package_id
-        product_id, product_name = get_or_create_product(
-            package_id=package_id,
-            package_name=row.get("package_name") or package_id,
-            price=0.0  # prix mis à jour par le job daily produits
-        )
+        partner_id = ensure_partner(email, prenom, nom)
 
-        partner_id = find_or_create_partner(email, email)
+        note_parts = [
+            f"Commande Airalo #{order_id_airalo}",
+            f"Statut: {status}",
+        ]
+        if iccid:
+            note_parts.append(f"ICCID: {iccid}")
+        if qr_code_url:
+            note_parts.append(f"QR: {qr_code_url}")
+        if apple_url:
+            note_parts.append(f"Apple install: {apple_url}")
+        if data_balance:
+            note_parts.append(f"Data restante: {data_balance}")
+        if created_at:
+            note_parts.append(f"Date création: {created_at}")
 
-        # Création du devis Airalo dans Odoo
-        order_id = models.execute_kw(
-            ODOO_DB,
-            uid,
-            ODOO_PASSWORD,
-            "sale.order",
-            "create",
-            [
-                {
-                    "partner_id": partner_id,
-                    "client_order_ref": order_ref,
-                    "date_order": created_at,
-                    "order_line": [
-                        (
-                            0,
-                            0,
-                            {
-                                "product_id": product_id,
-                                "name": product_name,
-                                "product_uom_qty": 1,
-                                "price_unit": 0.0,
-                            },
-                        )
-                    ],
-                }
-            ],
+        note = "\n".join(note_parts)
+
+        vals = {
+            'partner_id': partner_id,
+            'client_order_ref': client_order_ref,
+            'origin': 'Airalo',
+            'note': note,
+        }
+
+        new_so_id = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'sale.order', 'create',
+            [vals]
         )
-        print(f"🟢 Commande Airalo créée : {order_ref} (ID {order_id})")
+        created_count += 1
 
     print("✅ Commandes Airalo synchronisées.")
 
 
-# -----------------------
-# SYNC PAIEMENTS STRIPE (TABLE orders)
-# -----------------------
+# ============================================================
+#  SYNC STRIPE PAYMENTS (commande + produit + confirmation)
+# ============================================================
+
 def sync_stripe_payments():
+    """
+    Synchronisation des paiements Stripe (table orders) vers Odoo.
+    - 1 commande Odoo par session Stripe (client_order_ref = stripe_session_id)
+    - 1 produit par package_id (Option A)
+    - 1 ligne de commande avec ce produit
+    - Confirmation de la commande
+    """
     print("💳 Sync Stripe…")
-    rows = supabase.table("orders").select("*").execute().data
+
+    res = supabase.table("orders").select("*").order("created_at", desc=False).execute()
+    rows = res.data or []
     print(f"📄 {len(rows)} lignes orders récupérées.")
 
     for row in rows:
-        status = row.get("status", "")
-        email = row.get("email")
-        stripe_session_id = row.get("stripe_session_id")
-        package_id = row.get("package_id")
-        created_at = normalize_date(row.get("created_at"))
+        status = row.get('status')
+        email = row.get('email')
+        stripe_session_id = row.get('stripe_session_id')
 
-        if status != "completed":
+        if status != 'completed':
             continue
 
         print(f"🔎 Stripe row → {email} | status={status}")
 
         if not stripe_session_id:
-            print(f"⚠️ Stripe : pas de stripe_session_id pour {email}, ignoré.")
+            print(f"⚠️ Ignoré : pas de stripe_session_id pour {email}")
             continue
 
-        # Si la commande existe déjà en Odoo, on ne recrée pas
-        odoo_order_id = find_odoo_order(stripe_session_id)
+        # Nom / prénom
+        first_name = row.get('first_name') or row.get('prenom')
+        last_name = row.get('last_name') or row.get('nom')
 
-        # On (re)garantit qu'il y a un produit
-        package_name = row.get("package_name") or package_id
-        data_amount = row.get("data_amount")
-        data_unit = row.get("data_unit")
-        validity = row.get("validity")
-        amount = row.get("amount") or 0
+        partner_id = ensure_partner(email, first_name, last_name)
+        product_id = get_or_create_product_for_order(row)
 
-        # montant Supabase → généralement en "unités" (ex: 300 = 3€) → à adapter si besoin
-        price_eur = float(amount) / 100.0 if amount and amount > 0 else 0.0
+        # Chercher ou créer la commande Odoo
+        existing_so_id = find_odoo_order_by_stripe_ref(stripe_session_id)
 
-        if not package_id:
-            print(f"⚠️ Stripe : package_id manquant pour {stripe_session_id}, ignoré.")
-            continue
+        if existing_so_id:
+            print(f"ℹ️ Commande Stripe déjà existante dans Odoo (ID {existing_so_id})")
+            order_id = existing_so_id
+        else:
+            # Créer une nouvelle commande
+            package_name = row.get('package_name') or "Forfait eSIM"
+            data_amount = row.get('data_amount')
+            data_unit = row.get('data_unit')
+            validity = row.get('validity')
 
-        product_id, product_name = get_or_create_product(
-            package_id=package_id,
-            package_name=package_name,
-            price=price_eur,
-            data_amount=data_amount,
-            data_unit=data_unit,
-            validity_days=validity,
-        )
-
-        partner_display_name = row.get("nom") or row.get("last_name") or email
-        partner_id = find_or_create_partner(email, partner_display_name)
-
-        # Si commande n'existe pas encore → on crée
-        if not odoo_order_id:
-            line_desc_parts = []
-            if package_name:
-                line_desc_parts.append(str(package_name))
+            label_parts = [package_name]
             if data_amount and data_unit:
-                line_desc_parts.append(f"{data_amount} {data_unit}")
+                label_parts.append(f"{data_amount} {data_unit}")
             if validity:
-                line_desc_parts.append(f"{validity} jours")
+                label_parts.append(f"{validity} jours")
+            description = " - ".join(label_parts)
 
-            if line_desc_parts:
-                line_name = " - ".join(line_desc_parts)
-            else:
-                line_name = product_name
-
-            order_vals = {
-                "partner_id": partner_id,
-                "client_order_ref": stripe_session_id,
-                "date_order": created_at,
-                "order_line": [
-                    (
-                        0,
-                        0,
-                        {
-                            "product_id": product_id,
-                            "name": line_name,
-                            "product_uom_qty": 1,
-                            "price_unit": price_eur if price_eur > 0 else 0.0,
-                        },
-                    )
-                ],
+            vals = {
+                'partner_id': partner_id,
+                'client_order_ref': stripe_session_id,
+                'origin': 'Stripe',
+                'note': description,
             }
 
-            odoo_order_id = models.execute_kw(
-                ODOO_DB,
-                uid,
-                ODOO_PASSWORD,
-                "sale.order",
-                "create",
-                [order_vals],
+            order_id = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                'sale.order', 'create',
+                [vals]
             )
-            print(f"🧾 Commande Stripe créée (ID {odoo_order_id}) pour {stripe_session_id}")
-        else:
-            print(f"ℹ️ Commande Stripe déjà existante dans Odoo (ID {odoo_order_id})")
+            print(f"🧾 Commande Stripe créée (ID {order_id})")
 
-        # Tentative de confirmation (passe le devis en commande)
-        confirm_order(odoo_order_id)
+        # S'assurer que la commande a au moins une ligne produit
+        ensure_order_has_line(order_id, product_id, row)
+
+        # Confirmer la commande
+        confirm_order(order_id)
 
     print("✅ Sync Stripe terminé.")
 
 
-# -----------------------
-# MAIN
-# -----------------------
+# ============================================================
+#  MAIN
+# ============================================================
+
 if __name__ == "__main__":
     print("🚀 FAST SYNC STARTED")
+    start = time.time()
 
-    # Airalo : s'assure que les commandes techniques sont présentes
     sync_airalo_orders()
-
-    # Stripe : crée les commandes clients payées + auto-création produits
     sync_stripe_payments()
 
+    duration = time.time() - start
     print("✅ FAST SYNC DONE")
+    print(f"⏱ Durée : {duration:.1f}s")
