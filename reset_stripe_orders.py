@@ -1,27 +1,39 @@
-name: Reset Stripe Orders
+import os
+import xmlrpc.client
 
-on:
-  workflow_dispatch:
+# Variables d'environnement
+ODOO_URL = os.getenv("ODOO_URL")
+ODOO_DB = os.getenv("ODOO_DB")
+ODOO_USER = os.getenv("ODOO_USER")
+ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
 
-jobs:
-  reset:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+if not ODOO_URL or not ODOO_DB or not ODOO_USER or not ODOO_PASSWORD:
+    print("❌ Variables d'environnement Odoo manquantes.")
+    exit(1)
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
+# Connexion XML-RPC
+common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
+uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
+models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
-      - name: Install dependencies
-        run: pip install python-dotenv
+print("🔎 Recherche des commandes Stripe…")
 
-      - name: Run reset script
-        env:
-          ODOO_URL: ${{ secrets.ODOO_URL }}
-          ODOO_DB: ${{ secrets.ODOO_DB }}
-          ODOO_USER: ${{ secrets.ODOO_USER }}
-          ODOO_PASSWORD: ${{ secrets.ODOO_PASSWORD }}
-        run: python reset_stripe_orders.py
+# Rechercher les commandes où origin = "Stripe"
+order_ids = models.execute_kw(
+    ODOO_DB, uid, ODOO_PASSWORD,
+    'sale.order', 'search',
+    [[('origin', '=', 'Stripe')]]
+)
+
+print(f"🗑 {len(order_ids)} commandes Stripe trouvées.")
+
+# Suppression
+if order_ids:
+    models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'sale.order', 'unlink',
+        [order_ids]
+    )
+    print("✅ Commandes Stripe supprimées avec succès.")
+else:
+    print("ℹ️ Aucune commande Stripe à supprimer.")
