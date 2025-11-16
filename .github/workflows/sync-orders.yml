@@ -1,0 +1,33 @@
+name: Sync Orders & Payments (Fast)
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"     # Toutes les 30 minutes
+  workflow_dispatch:           # Lancement manuel
+
+jobs:
+  sync-orders:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install supabase python-dotenv requests xmlrpc.client
+
+      - name: Run fast order & payment sync
+        run: python main_fast.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_USER: ${{ secrets.ODOO_USER }}
+          ODOO_PASSWORD: ${{ secrets.ODOO_PASSWORD }}
