@@ -23,6 +23,7 @@ common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
 uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
 models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
+
 # -----------------------
 # UTILS
 # -----------------------
@@ -117,8 +118,8 @@ def register_payment(inv_id, amount):
             [{
                 "payment_date": datetime.now().strftime("%Y-%m-%d"),
                 "amount": amount,
-                "payment_method_line_id": 1,  # Usually “Manual payment”
-                "journal_id": 1,  # Bank/cash journal ID – adjust if needed
+                "payment_method_line_id": 1,  # to adjust if needed
+                "journal_id": 1,              # your bank journal
                 "communication": "Stripe payment",
                 "line_ids": [(6, 0, [inv_id])]
             }]
@@ -126,8 +127,9 @@ def register_payment(inv_id, amount):
     except Exception as e:
         print("❌ Error recording payment:", e)
 
+
 # -----------------------
-# SYNC PAYMENTS (FAST)
+# SYNC STRIPE ORDERS ONLY (FAST)
 # -----------------------
 print("🚀 Début synchronisation rapide Supabase → Odoo")
 
@@ -135,6 +137,10 @@ rows = supabase.table("orders").select("*").execute().data
 
 for r in rows:
     if r.get("status") != "completed":
+        continue
+
+    if not r.get("stripe_session_id"):
+        # Ignore Airalo or incomplete orders
         continue
 
     order_ref = r.get("order_id")
@@ -153,12 +159,12 @@ for r in rows:
     partner = get_or_create_partner(email)
     odoo_order = find_order(order_ref)
 
-    # If order EXISTS → confirm & process invoice
+    # If order exists, confirm it again
     if odoo_order:
         print("↪️ Existing Odoo order:", order_ref)
         confirm_order(odoo_order)
 
-    # If NOT exists → create order
+    # Otherwise create order
     else:
         print("🟢 Creating Odoo order:", order_ref)
         odoo_order = models.execute_kw(
