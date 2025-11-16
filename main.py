@@ -6,6 +6,7 @@ import xmlrpc.client
 from supabase import create_client
 from dotenv import load_dotenv
 from datetime import datetime
+import stripe
 
 load_dotenv()
 
@@ -16,9 +17,16 @@ ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
 ODOO_USER = os.getenv("ODOO_USER")
 ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 
 if not all([SUPABASE_URL, SUPABASE_KEY, ODOO_URL, ODOO_DB, ODOO_USER, ODOO_PASSWORD]):
     raise RuntimeError("❌ Variables d'environnement manquantes. Vérifie SUPABASE_* et ODOO_*")
+
+# Stripe init
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
+else:
+    print("⚠️ STRIPE_SECRET_KEY non défini → Stripe désactivé pour le moment.")
 
 # 🔗 Connexions
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -77,8 +85,6 @@ def get_image_base64_from_url(url: str):
         resp = requests.get(url, timeout=15)
         if resp.status_code == 200:
             return base64.b64encode(resp.content).decode("utf-8")
-        else:
-            print(f"⚠️ Erreur image ({resp.status_code}) : {url}")
     except Exception as e:
         print(f"❌ Exception image {url}: {e}")
     return None
@@ -202,6 +208,49 @@ def upsert_product(row: dict):
     print(f"✅ Produit créé : {package_id}")
 
 
+# 🔍 Stripe : récupérer paiement
+def get_stripe_payment(session_id: str):
+    """Retourne paiement Stripe à partir d'une session Checkout."""
+    if not STRIPE_SECRET_KEY:
+        return None
+
+    if not session_id:
+        return None
+
+    try:
+        session = stripe.checkout.Session.retrieve(
+            session_id,
+            expand=["payment_intent.charges"],
+        )
+
+        payment_status = session.get("payment_status")  # 'paid', 'unpaid'
+        payment_intent = session.get("payment_intent")
+
+        if not payment_intent:
+            return None
+
+        pi_id = payment_intent.get("id")
+        amount = payment_intent.get("amount_received", 0) / 100
+        currency = payment_intent.get("currency", "eur").upper()
+
+        charge_id = None
+        charges = payment_intent.get("charges", {}).get("data", [])
+        if charges:
+            charge_id = charges[0].get("id")
+
+        return {
+            "status": payment_status,
+            "pi_id": pi_id,
+            "charge_id": charge_id,
+            "amount": amount,
+            "currency": currency,
+        }
+
+    except Exception as e:
+        print(f"⚠️ Erreur Stripe pour session {session_id}: {e}")
+        return None
+
+
 # 🔁 Sync produits Airalo
 def sync_airalo_packages():
     print("🚀 Sync produits Airalo...")
@@ -214,7 +263,7 @@ def sync_airalo_packages():
     print("🎉 Produits Airalo synchronisés.")
 
 
-# 👤 Trouver ou créer un partenaire
+# 👤 Trouver ou créer partenaire
 def find_or_create_partner(email, full_name):
     partners = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
@@ -232,7 +281,7 @@ def find_or_create_partner(email, full_name):
     )
 
 
-# 🔎 Trouver produit
+# 🔎 Trouver un produit
 def find_product(package_id):
     product = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
@@ -251,19 +300,17 @@ def sync_airalo_orders():
     for row in rows:
         order_ref = row.get("order_id") or row.get("id")
         if not order_ref:
-            print(f"⚠️ Ignorée : pas d'order_id")
             continue
 
         email = row.get("email")
         package_id = row.get("package_id")
         if not email or not package_id:
-            print(f"⚠️ Commande {order_ref} ignorée (email ou package_id manquant)")
             continue
 
         full_name = f"{row.get('prenom','')} {row.get('nom','')}".strip()
         created_at = normalize_odoo_datetime(row.get("created_at"))
 
-        # Si déjà en Odoo → skip
+        # Skip si déjà importée
         existing = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             "sale.order", "search",
@@ -312,18 +359,17 @@ def sync_orders():
     for row in rows:
         order_ref = row.get("order_id") or row.get("id")
         if not order_ref:
-            print(f"⚠️ Ignorée : pas d'order_id")
             continue
 
         email = row.get("email")
         package_id = row.get("package_id")
         if not email or not package_id:
-            print(f"⚠️ Commande {order_ref} ignorée (email ou package_id manquant)")
             continue
 
         full_name = f"{row.get('prenom','')} {row.get('nom','')}".strip()
         created_at = normalize_odoo_datetime(row.get("created_at"))
 
+        # Skip si déjà importée
         existing = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             "sale.order", "search",
@@ -335,6 +381,7 @@ def sync_orders():
 
         partner_id = find_or_create_partner(email, full_name)
         product = find_product(package_id)
+
         if not product:
             print(f"❌ Produit introuvable commande standard : {package_id}")
             continue
