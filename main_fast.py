@@ -1,220 +1,215 @@
 import os
-import xmlrpc.client
-from supabase import create_client
+import requests
 from datetime import datetime
+from supabase import create_client
+import xmlrpc.client
 
-# -------------------------------------
-# CONFIG
-# -------------------------------------
+# -----------------------------
+# 🔗 Connexions Supabase et Odoo
+# -----------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
 ODOO_USER = os.getenv("ODOO_USER")
 ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
 
-if not all([SUPABASE_URL, SUPABASE_KEY, ODOO_URL, ODOO_DB, ODOO_USER, ODOO_PASSWORD]):
-    raise RuntimeError("❌ Missing environment variables.")
-
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Connexion Odoo
 common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
 uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
 models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
+print("🚀 FAST SYNC STARTED")
 
-# -------------------------------------
-# UTILS
-# -------------------------------------
-def normalize_date(date_value):
-    if not date_value:
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# -----------------------------
+# 📌 Helpers
+# -----------------------------
+def normalize_date(date_str):
+    if not date_str:
+        return None
     try:
-        dt = datetime.fromisoformat(str(date_value).replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if isinstance(date_str, datetime):
+            return date_str.strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.fromisoformat(date_str.replace("Z", "")).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    except:
+        return None
 
 
-def find_or_create_partner(email, name=None):
+def find_partner_by_email(email):
     res = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "res.partner", "search_read",
+        ODOO_DB,
+        uid,
+        ODOO_PASSWORD,
+        "res.partner",
+        "search_read",
         [[["email", "=", email]]],
-        {"fields": ["id"], "limit": 1}
-    )
-    if res:
-        return res[0]["id"]
-
-    partner_id = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "res.partner", "create",
-        [{
-            "name": name or email,
-            "email": email,
-            "customer_rank": 1
-        }]
-    )
-    print(f"🆕 Partner créé : {email} (ID {partner_id})")
-    return partner_id
-
-
-def find_product(package_id):
-    res = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "product.product", "search_read",
-        [[["default_code", "=", package_id]]],
-        {"fields": ["id", "name", "list_price"], "limit": 1}
+        {"fields": ["id", "name"], "limit": 1},
     )
     return res[0] if res else None
+
+
+def create_partner(email, name):
+    pid = models.execute_kw(
+        ODOO_DB,
+        uid,
+        ODOO_PASSWORD,
+        "res.partner",
+        "create",
+        [{"name": name, "email": email}],
+    )
+    print(f"🆕 Partner créé : {email} (ID {pid})")
+    return {"id": pid, "name": name}
 
 
 def find_odoo_order(order_ref):
     res = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "sale.order", "search",
+        ODOO_DB,
+        uid,
+        ODOO_PASSWORD,
+        "sale.order",
+        "search_read",
         [[["client_order_ref", "=", order_ref]]],
-        {"limit": 1}
+        {"fields": ["id", "state"], "limit": 1},
     )
     return res[0] if res else None
 
 
+def create_odoo_order(partner_id, product_id, order_ref):
+    sale_id = models.execute_kw(
+        ODOO_DB,
+        uid,
+        ODOO_PASSWORD,
+        "sale.order",
+        "create",
+        [
+            {
+                "partner_id": partner_id,
+                "client_order_ref": order_ref,
+                "order_line": [
+                    [
+                        0,
+                        0,
+                        {
+                            "product_id": product_id,
+                            "product_uom_qty": 1,
+                            "price_unit": 0,
+                        },
+                    ]
+                ],
+            }
+        ],
+    )
+    print(f"🟢 Commande Airalo créée : {order_ref}")
+    return sale_id
+
+
 def confirm_order(order_id):
-    if not order_id:
-        return
     try:
         models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            "sale.order", "action_confirm",
-            [[order_id]]
+            ODOO_DB, uid, ODOO_PASSWORD, "sale.order", "action_confirm", [[order_id]]
         )
-        print(f"🟢 Commande confirmée : {order_id}")
+        print(f"✔️ Commande confirmée (ID {order_id})")
     except Exception as e:
-        print(f"⚠️ Erreur confirmation {order_id} : {e}")
+        print("⚠️ Impossible de confirmer :", e)
 
 
-# -------------------------------------
-# SYNC AIRALO ORDERS
-# -------------------------------------
+def mark_as_paid(order_id):
+    try:
+        models.execute_kw(
+            ODOO_DB,
+            uid,
+            ODOO_PASSWORD,
+            "sale.order",
+            "write",
+            [[order_id], {"state": "sale"}],
+        )
+        print(f"💰 Commande marquée PAYÉE (ID {order_id})")
+    except Exception as e:
+        print("⚠️ Impossible de passer en payé :", e)
+
+
+# -----------------------------
+# 🔄 Sync Airalo → Odoo
+# -----------------------------
 def sync_airalo_orders():
     print("🔄 Sync Airalo orders…")
-    rows = supabase.table("airalo_orders").select("*").execute().data
 
-    if not rows:
-        print("⚠️ Table airalo_orders vide.")
-        return
+    data = (
+        supabase.table("airalo_orders")
+        .select("*")
+        .order("created_at", desc=False)
+        .execute()
+    ).data
 
-    print(f"📄 {len(rows)} lignes Airalo récupérées.")
+    print(f"📄 {len(data)} lignes Airalo récupérées.")
 
-    for row in rows:
-        order_ref = row.get("order_id")
+    for row in data:
         email = row.get("email")
+        order_ref = str(row.get("order_id"))
         package_id = row.get("package_id")
         created_at = normalize_date(row.get("created_at"))
 
-        if not order_ref or not email or not package_id:
+        # Check/existing partner
+        partner = find_partner_by_email(email)
+        if not partner:
+            partner = create_partner(email, email)
+
+        # Already existing order ?
+        odoo_order = find_odoo_order(order_ref)
+        if odoo_order:
             continue
 
-        if find_odoo_order(order_ref):
-            continue
-
-        product = find_product(package_id)
-        if not product:
-            print(f"❌ Produit introuvable Airalo : {package_id}")
-            continue
-
-        partner_id = find_or_create_partner(email, email)
-
-        order_id = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            "sale.order", "create",
-            [{
-                "partner_id": partner_id,
-                "client_order_ref": order_ref,
-                "date_order": created_at,
-                "order_line": [
-                    (0, 0, {
-                        "product_id": product["id"],
-                        "name": product["name"],
-                        "product_uom_qty": 1,
-                        "price_unit": product["list_price"],
-                    })
-                ],
-            }]
-        )
-        print(f"🟢 Commande Airalo créée : {order_ref}")
+        # Create order
+        sale_id = create_odoo_order(partner["id"], 1, order_ref)  # Product ignored (fast)
+        confirm_order(sale_id)
 
 
-# -------------------------------------
-# SYNC STRIPE PAYMENTS
-# -------------------------------------
+# -----------------------------
+# 💳 Sync Stripe Payments → Odoo
+# -----------------------------
 def sync_stripe_payments():
     print("💳 Sync Stripe…")
 
-    # Récupération complète (plus fiable que eq("status"))
-    rows = supabase.table("orders").select("*").execute().data
-
-    if not rows:
-        print("⚠️ Table orders vide !")
-        return
-
+    rows = supabase.table("orders").select("*").order("created_at").execute().data
     print(f"📄 {len(rows)} lignes orders récupérées.")
 
     for row in rows:
         email = row.get("email")
         order_ref = row.get("order_id")
-        package_id = row.get("package_id")
-        created_at = normalize_date(row.get("created_at"))
-
-        # Status propre et en minuscules
-        status = (row.get("status") or "").strip().lower()
+        status = (row.get("status") or "").lower().strip()
 
         print(f"🔎 Stripe row → {email} | status={status}")
 
-        # On ne traite que les paiements validés
+        # ---------------------------------------------
+        # ❗ Fix principal : ignorer les lignes sans order_id
+        # ---------------------------------------------
+        if not order_ref:
+            print(f"⚠️ Ignoré : order_id manquant pour {email}")
+            continue
+
+        # Status must be completed
         if status != "completed":
             continue
 
+        # Check order
         odoo_order = find_odoo_order(order_ref)
-
-        # CREATION SI ABSENTE
         if not odoo_order:
-            product = find_product(package_id)
-            if not product:
-                print(f"❌ Produit inconnu Stripe : {package_id}")
-                continue
+            print(f"⚠️ Commande Stripe mais pas trouvée dans Odoo → {order_ref}")
+            continue
 
-            partner_id = find_or_create_partner(email, email)
-
-            odoo_order = models.execute_kw(
-                ODOO_DB, uid, ODOO_PASSWORD,
-                "sale.order", "create",
-                [{
-                    "partner_id": partner_id,
-                    "client_order_ref": order_ref,
-                    "date_order": created_at,
-                    "order_line": [
-                        (0, 0, {
-                            "product_id": product["id"],
-                            "name": product["name"],
-                            "product_uom_qty": 1,
-                            "price_unit": product["list_price"],
-                        })
-                    ],
-                }]
-            )
-            print(f"🟢 Commande Stripe créée : {order_ref}")
-
-        # CONFIRMATION
-        confirm_order(odoo_order)
+        # Mark as paid
+        mark_as_paid(odoo_order["id"])
 
 
-# -------------------------------------
-# MAIN
-# -------------------------------------
-if __name__ == "__main__":
-    print("🚀 FAST SYNC STARTED")
-    sync_airalo_orders()
-    sync_stripe_payments()
-    print("✅ FAST SYNC DONE")
+# -----------------------------
+# 🚀 MAIN
+# -----------------------------
+sync_airalo_orders()
+sync_stripe_payments()
+
+print("✅ FAST SYNC DONE")
