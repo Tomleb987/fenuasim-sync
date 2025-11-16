@@ -2,8 +2,8 @@ name: Sync Airalo Products (Daily)
 
 on:
   schedule:
-    - cron: "0 3 * * *"   # Tous les jours à 03h00 UTC
-  workflow_dispatch:       # Permet de lancer manuellement
+    - cron: "0 3 * * *"
+  workflow_dispatch:
 
 jobs:
   sync-products:
@@ -20,7 +20,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install supabase python-dotenv requests xmlrpc
+          pip install supabase python-dotenv requests
           pip list
 
       - name: Run daily product sync
