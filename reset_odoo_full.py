@@ -12,44 +12,52 @@ common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
 uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
 models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
+
 def wipe(model, domain=None):
+    """Supprime un modèle en continuant même si Odoo bloque."""
     if domain is None:
         domain = []
-    ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, model, 'search', [domain])
-    if ids:
-        models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, model, 'unlink', [ids])
-        print(f"🗑 {model} : {len(ids)} supprimés.")
-    else:
-        print(f"ℹ️ {model} : aucun enregistrement.")
 
-print("🔥 Reset FULL Odoo — suppression de toutes les données…")
+    try:
+        ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                                model, 'search', [domain])
+        if ids:
+            try:
+                models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                                  model, 'unlink', [ids])
+                print(f"🗑 {model} : {len(ids)} supprimés.")
+            except Exception as e:
+                print(f"⚠️ Impossible de supprimer {model} (on continue) : {e}")
+        else:
+            print(f"ℹ️ {model} : aucun enregistrement.")
+    except Exception as e:
+        print(f"⚠️ Erreur lors de la recherche de {model} : {e}")
 
-# 1. Attachments
-wipe('ir.attachment')
 
-# 2. Paiements
-wipe('account.payment')
+print("🔥 RESET COMPLET — version Odoo Online…")
 
-# 3. Factures
-wipe('account.move', [('move_type', 'in', ['out_invoice', 'out_refund'])])
 
-# 4. Lignes comptables
-wipe('account.move.line')
+# 1️⃣ Factures & Écritures comptables (must delete FIRST)
+wipe('account.move', [('move_type', '!=', 'entry')])   # factures
+wipe('account.move', [('move_type', '=', 'entry')])    # écritures diverses
+wipe('account.move.line')                               # lignes comptables
 
-# 5. Commandes vente
+# 2️⃣ Paiements
+wipe('account.payment')  # peut échouer → ignoré automatiquement
+
+# 3️⃣ Commandes de vente + leurs lignes
+wipe('sale.order.line')
 wipe('sale.order')
 
-# 6. Lignes de commandes
-wipe('sale.order.line')
-
-# 7. Clients / Contacts (hors entreprises)
-wipe('res.partner', [('is_company', '=', False)])
-
-# 8. Produits
+# 4️⃣ Produits & catégories
 wipe('product.product')
 wipe('product.template')
-
-# 9. Catégories produits
 wipe('product.category')
 
-print("✅ RESET COMPLET TERMINÉ.")
+# 5️⃣ Clients (garder l’entreprise principale)
+wipe('res.partner', [('id', '!=', 1)])
+
+# 6️⃣ Attachments
+wipe('ir.attachment')
+
+print("✅ RESET ODOO TERMINÉ — Base propre et vide.")
