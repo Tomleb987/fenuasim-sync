@@ -3,7 +3,10 @@ import sys
 import time
 import datetime
 import xmlrpc.client
+import base64
+import mimetypes
 
+import requests
 from supabase import create_client, Client
 
 # ============================================================
@@ -37,7 +40,44 @@ if not uid:
 
 models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object", allow_none=True)
 
-ESIM_CATEGORY_ID = None  # cache global pour la catégorie produit eSIM
+ESIM_CATEGORY_ID = None           # cache catégorie produit eSIM
+AIRALO_PACKAGES_CACHE = None      # cache des packages Airalo (clé = package_id)
+ONLINE_JOURNAL_ID = None          # journal "Paiement en ligne"
+
+
+# ============================================================
+#  HELPERS SUPABASE
+# ============================================================
+
+def load_airalo_packages_cache():
+    """
+    Charge tous les packages Airalo en mémoire, indexés par package_id.
+    Permet de récupérer image_url + métadonnées.
+    """
+    global AIRALO_PACKAGES_CACHE
+    if AIRALO_PACKAGES_CACHE is not None:
+        return AIRALO_PACKAGES_CACHE
+
+    print("🔁 Chargement du cache airalo_packages…")
+    res = supabase.table("airalo_packages").select("*").execute()
+    rows = res.data or []
+    cache = {}
+    for row in rows:
+        pid = row.get("package_id")
+        if not pid:
+            continue
+        cache[pid] = row
+    AIRALO_PACKAGES_CACHE = cache
+    print(f"📦 Cache airalo_packages chargé : {len(cache)} entrées.")
+    return AIRALO_PACKAGES_CACHE
+
+
+def get_airalo_package_meta(package_id: str):
+    """Retourne la ligne airalo_packages correspondant à package_id (ou None)."""
+    if not package_id:
+        return None
+    cache = load_airalo_packages_cache()
+    return cache.get(package_id)
 
 
 # ============================================================
@@ -50,7 +90,6 @@ def get_or_create_esim_category():
     if ESIM_CATEGORY_ID:
         return ESIM_CATEGORY_ID
 
-    # Chercher la catégorie existante
     cat_ids = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
         'product.category', 'search',
@@ -61,7 +100,7 @@ def get_or_create_esim_category():
         ESIM_CATEGORY_ID = cat_ids[0]
         return ESIM_CATEGORY_ID
 
-    # Chercher le compte 706100 (facultatif si non trouvé)
+    # Chercher le compte 706100 (si dispo)
     income_account_id = False
     try:
         acc_ids = models.execute_kw(
@@ -126,6 +165,7 @@ def get_or_create_product_for_order(row):
     """
     Crée / récupère un produit Odoo à partir d'une ligne Stripe (table orders).
     Clé = package_id (Option A).
+    On utilise si possible les infos de airalo_packages (image, libellé…).
     """
     package_id = row.get('package_id')
     package_name = row.get('package_name') or "Forfait eSIM"
@@ -133,8 +173,16 @@ def get_or_create_product_for_order(row):
     data_unit = row.get('data_unit')
     validity = row.get('validity')
 
+    # Métadonnées Airalo
+    meta = get_airalo_package_meta(package_id)
+    if meta:
+        # On surclasse avec ce qui vient d'airalo_packages si présent
+        package_name = meta.get('name') or meta.get('package_name') or package_name
+        data_amount = meta.get('data_amount') or data_amount
+        data_unit = meta.get('data_unit') or data_unit
+        validity = meta.get('validity') or validity
+
     if not package_id:
-        # fallback très rare
         package_id = f"ESIM-{data_amount or ''}{data_unit or ''}-{validity or ''}j"
 
     # Chercher produit par code interne = package_id
@@ -147,7 +195,6 @@ def get_or_create_product_for_order(row):
     if product_ids:
         return product_ids[0]
 
-    # Création du produit
     categ_id = get_or_create_esim_category()
 
     # Prix : priorité à field "price", sinon amount/100
@@ -159,15 +206,15 @@ def get_or_create_product_for_order(row):
         price = float(price)
 
     # Nom lisible
-    label_parts = []
+    label_parts = [package_name]
     if data_amount and data_unit:
         label_parts.append(f"{data_amount} {data_unit}")
     if validity:
         label_parts.append(f"{validity} jours")
-    label = " - ".join(label_parts) if label_parts else package_name
+    label = " - ".join(label_parts)
 
     vals = {
-        'name': f"{label}",
+        'name': label,
         'default_code': package_id,
         'type': 'service',
         'detailed_type': 'service',
@@ -206,7 +253,6 @@ def ensure_order_has_line(order_id, product_id, row):
     S'assure que la sale.order a au moins une ligne avec un produit.
     Si aucune ligne / aucune ligne avec product_id => on ajoute une ligne.
     """
-    # Prix
     price = row.get('price')
     if price is None:
         amount = row.get('amount') or 0
@@ -214,7 +260,6 @@ def ensure_order_has_line(order_id, product_id, row):
     else:
         price = float(price)
 
-    # Libellé de ligne
     package_name = row.get('package_name') or "Forfait eSIM"
     data_amount = row.get('data_amount')
     data_unit = row.get('data_unit')
@@ -227,7 +272,6 @@ def ensure_order_has_line(order_id, product_id, row):
         line_label_parts.append(f"{validity} jours")
     line_name = " - ".join(line_label_parts)
 
-    # Lire les lignes existantes
     order_data = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
         'sale.order', 'read',
@@ -236,7 +280,6 @@ def ensure_order_has_line(order_id, product_id, row):
     line_ids = order_data.get('order_line', [])
 
     if line_ids:
-        # Vérifier si au moins une ligne a déjà un produit
         lines = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'sale.order.line', 'read',
@@ -244,10 +287,8 @@ def ensure_order_has_line(order_id, product_id, row):
         )
         has_product = any(l.get('product_id') and l['product_id'][0] for l in lines)
         if has_product:
-            # Rien à faire
             return
 
-    # Ajouter une nouvelle ligne avec produit
     models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
         'sale.order', 'write',
@@ -265,7 +306,7 @@ def ensure_order_has_line(order_id, product_id, row):
 
 
 def confirm_order(order_id):
-    """Tente de confirmer la commande (passage du devis à la commande)."""
+    """Tente de confirmer la commande."""
     try:
         models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
@@ -275,6 +316,197 @@ def confirm_order(order_id):
         print(f"✅ Commande confirmée dans Odoo (ID {order_id})")
     except Exception as e:
         print(f"❌ Erreur passage en payé :", e)
+
+
+def get_online_journal_id():
+    """Retourne l'ID du journal 'Paiement en ligne' (cache)."""
+    global ONLINE_JOURNAL_ID
+    if ONLINE_JOURNAL_ID:
+        return ONLINE_JOURNAL_ID
+
+    journal_ids = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'account.journal', 'search',
+        [[('name', '=', 'Paiement en ligne')]],
+        {'limit': 1}
+    )
+    if not journal_ids:
+        print("⚠️ Journal 'Paiement en ligne' introuvable. Pas de paiement auto.")
+        return None
+
+    ONLINE_JOURNAL_ID = journal_ids[0]
+    print(f"📒 Journal Paiement en ligne trouvé (ID {ONLINE_JOURNAL_ID})")
+    return ONLINE_JOURNAL_ID
+
+
+def attach_product_image_to_invoice(invoice_id, row):
+    """
+    Ajoute l'image du forfait (airalo_packages.image_url) en pièce jointe sur la facture.
+    Une seule pièce jointe par package_id et par facture.
+    """
+    package_id = row.get('package_id')
+    if not package_id:
+        return
+
+    meta = get_airalo_package_meta(package_id)
+    if not meta:
+        return
+
+    image_url = meta.get('image_url')
+    if not image_url:
+        return
+
+    # Nom de fichier standardisé pour éviter les doublons
+    filename = f"{package_id}.jpg"
+
+    # Vérifier si déjà attaché
+    existing = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'ir.attachment', 'search',
+        [[
+            ('res_model', '=', 'account.move'),
+            ('res_id', '=', invoice_id),
+            ('name', '=', filename),
+        ]],
+        {'limit': 1}
+    )
+    if existing:
+        print(f"ℹ️ Image déjà attachée à la facture (ID {invoice_id})")
+        return
+
+    try:
+        resp = requests.get(image_url, timeout=10)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"⚠️ Impossible de récupérer l'image ({image_url}) : {e}")
+        return
+
+    data_b64 = base64.b64encode(resp.content).decode()
+    mime, _ = mimetypes.guess_type(image_url)
+    if not mime:
+        mime = 'image/jpeg'
+
+    models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'ir.attachment', 'create',
+        [{
+            'name': filename,
+            'res_model': 'account.move',
+            'res_id': invoice_id,
+            'type': 'binary',
+            'datas': data_b64,
+            'mimetype': mime,
+        }]
+    )
+    print(f"🖼 Image forfait attachée à la facture (ID {invoice_id})")
+
+    # ⚠️ Pour que l'image apparaisse sur le PDF standard,
+    # il faudra ensuite adapter le rapport dans Odoo.
+    # Ici elle est bien stockée sur la facture côté back-office.
+
+
+def ensure_invoice_and_payment(order_id, partner_id, row):
+    """
+    Garantit qu'il existe une facture (account.move) pour la commande,
+    la poste si besoin, enregistre un paiement via 'Paiement en ligne'
+    si la facture n'est pas déjà payée, et attache l'image du forfait.
+    """
+    # Lire la commande pour récupérer les facture(s) éventuelles
+    so_data = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'sale.order', 'read',
+        [[order_id], ['invoice_ids', 'name']]
+    )[0]
+    invoice_ids = so_data.get('invoice_ids') or []
+
+    if invoice_ids:
+        invoice_id = invoice_ids[0]
+        print(f"ℹ️ Facture déjà existante pour commande {so_data.get('name')} (ID {invoice_id})")
+    else:
+        # Création de la facture
+        try:
+            invoice_ids = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                'sale.order', '_create_invoices',
+                [[order_id]]
+            )
+        except Exception as e:
+            print(f"❌ Erreur lors de la création de la facture pour la commande {order_id} :", e)
+            return
+
+        if not invoice_ids:
+            print(f"⚠️ Aucune facture créée pour la commande {order_id}.")
+            return
+
+        invoice_id = invoice_ids[0]
+        print(f"🧾 Facture générée (ID {invoice_id}) pour commande {so_data.get('name')}")
+
+    # Lire l'état de la facture
+    inv_data = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'account.move', 'read',
+        [[invoice_id], ['state', 'amount_total', 'amount_residual', 'payment_state']]
+    )[0]
+
+    # Poster la facture si nécessaire
+    if inv_data.get('state') != 'posted':
+        try:
+            models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                'account.move', 'action_post',
+                [[invoice_id]]
+            )
+            print(f"✅ Facture postée (ID {invoice_id})")
+        except Exception as e:
+            print(f"⚠️ Impossible de poster la facture {invoice_id} :", e)
+
+    # Attacher l'image du forfait
+    attach_product_image_to_invoice(invoice_id, row)
+
+    # Si déjà payée / soldée, on ne recrée pas de paiement
+    payment_state = inv_data.get('payment_state')
+    amount_residual = inv_data.get('amount_residual', 0.0)
+    if payment_state in ('paid', 'in_payment') or (amount_residual is not None and float(amount_residual) == 0.0):
+        print(f"ℹ️ Facture {invoice_id} déjà payée ou soldée (state={payment_state}).")
+        return
+
+    # Paiement via wizard account.payment.register
+    journal_id = get_online_journal_id()
+    if not journal_id:
+        return
+
+    amount_total = float(inv_data.get('amount_total') or 0.0)
+    if amount_total <= 0:
+        print(f"⚠️ Montant de facture nul ou négatif pour {invoice_id}, pas de paiement.")
+        return
+
+    context = {
+        'active_model': 'account.move',
+        'active_ids': [invoice_id],
+        'active_id': invoice_id,
+    }
+
+    try:
+        wizard_id = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'account.payment.register', 'create',
+            [{
+                'payment_date': datetime.date.today().isoformat(),
+                'journal_id': journal_id,
+                'amount': amount_total,
+            }],
+            {'context': context}
+        )
+
+        models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'account.payment.register', 'action_create_payments',
+            [[wizard_id]],
+            {'context': context}
+        )
+        print(f"💳 Paiement enregistré pour la facture {invoice_id} (journal Paiement en ligne).")
+    except Exception as e:
+        print(f"⚠️ Erreur lors de l'enregistrement du paiement pour la facture {invoice_id} :", e)
 
 
 # ============================================================
@@ -348,7 +580,7 @@ def sync_airalo_orders():
             'note': note,
         }
 
-        new_so_id = models.execute_kw(
+        models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'sale.order', 'create',
             [vals]
@@ -359,7 +591,7 @@ def sync_airalo_orders():
 
 
 # ============================================================
-#  SYNC STRIPE PAYMENTS (commande + produit + confirmation)
+#  SYNC STRIPE PAYMENTS (commande + produit + facture + paiement)
 # ============================================================
 
 def sync_stripe_payments():
@@ -369,8 +601,14 @@ def sync_stripe_payments():
     - 1 produit par package_id (Option A)
     - 1 ligne de commande avec ce produit
     - Confirmation de la commande
+    - Génération de la facture
+    - Paiement auto via journal 'Paiement en ligne'
+    - Image du forfait attachée à la facture (airalo_packages.image_url)
     """
     print("💳 Sync Stripe…")
+
+    # On charge le cache airalo_packages une fois
+    load_airalo_packages_cache()
 
     res = supabase.table("orders").select("*").order("created_at", desc=False).execute()
     rows = res.data or []
@@ -404,7 +642,6 @@ def sync_stripe_payments():
             print(f"ℹ️ Commande Stripe déjà existante dans Odoo (ID {existing_so_id})")
             order_id = existing_so_id
         else:
-            # Créer une nouvelle commande
             package_name = row.get('package_name') or "Forfait eSIM"
             data_amount = row.get('data_amount')
             data_unit = row.get('data_unit')
@@ -431,11 +668,14 @@ def sync_stripe_payments():
             )
             print(f"🧾 Commande Stripe créée (ID {order_id})")
 
-        # S'assurer que la commande a au moins une ligne produit
+        # Ligne produit
         ensure_order_has_line(order_id, product_id, row)
 
-        # Confirmer la commande
+        # Confirmation commande
         confirm_order(order_id)
+
+        # Facture + paiement + image
+        ensure_invoice_and_payment(order_id, partner_id, row)
 
     print("✅ Sync Stripe terminé.")
 
