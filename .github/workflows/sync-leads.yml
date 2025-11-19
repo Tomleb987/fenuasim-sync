@@ -25,9 +25,9 @@ jobs:
       - name: Run sync_leads script
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_KEY }}     # 🔥 ICI LA CORRECTION
           ODOO_URL: ${{ secrets.ODOO_URL }}
           ODOO_DB: fenua-sim
-          ODOO_USER: contact@fenuasim.com
-          ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
+          ODOO_USER: ${{ secrets.ODOO_USER }}
+          ODOO_API_KEY: ${{ secrets.ODOO_PASSWORD }}                 # 🔥 ta clé API Odoo
         run: python sync_leads.py
