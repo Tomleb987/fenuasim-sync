@@ -1,33 +1,33 @@
-name: Sync Leads to Odoo
+name: Sync Leads Odoo
 
 on:
-  schedule:
-    - cron: "*/10 * * * *"
   workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
 
 jobs:
-  sync-leads:
+  sync:
     runs-on: ubuntu-latest
 
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      ODOO_URL: ${{ secrets.ODOO_URL }}
+      ODOO_DB: ${{ secrets.ODOO_DB }}
+      ODOO_USER: ${{ secrets.ODOO_USER }}
+      ODOO_PASSWORD: ${{ secrets.ODOO_PASSWORD }}
+
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.10"
+          python-version: 3.10
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      - name: Run sync_leads script
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_KEY }}     # 🔥 ICI LA CORRECTION
-          ODOO_URL: ${{ secrets.ODOO_URL }}
-          ODOO_DB: fenua-sim
-          ODOO_USER: ${{ secrets.ODOO_USER }}
-          ODOO_API_KEY: ${{ secrets.ODOO_PASSWORD }}                 # 🔥 ta clé API Odoo
+      - name: Run lead sync
         run: python sync_leads.py
