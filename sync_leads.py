@@ -112,18 +112,20 @@ def ensure_lead(partner_id, first_name, last_name, email):
         print(f"⏭ Déjà synchronisé : {email}")
         return existing[0]
 
+    # --- CORRECTION ICI ---
     lid = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
         "crm.lead", "create",
         [{
             "name": f"Lead site FENUA SIM - {fullname}",
+            "type": "opportunity",  # <--- AJOUTE CETTE LIGNE POUR PASSER EN OPPORTUNITÉ
             "contact_name": fullname,
             "email_from": email,
             "partner_id": partner_id,
             "tag_ids": [(6, 0, [tag_id])],
         }]
     )
-    print(f"🟢 Lead synchronisé → Odoo ID {lid}")
+    print(f"🟢 Opportunité créée → Odoo ID {lid}")
     return lid
 
 
@@ -157,7 +159,7 @@ def sync_leads():
         pid = ensure_partner(first, last, email)
         ensure_lead(pid, first, last, email)
 
-    print("✨ Synchronisation des leads terminée")
+    print("✨ Synchronisation terminée")
     print("✅ SYNC LEADS DONE\n")
 
 
