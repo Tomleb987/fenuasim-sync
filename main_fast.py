@@ -218,12 +218,13 @@ def sync_stripe():
 
         order_id = find_order(ref)
         pid = ensure_partner(row.get("email"), row.get("first_name"), row.get("last_name"))
+        supabase.table("orders").update({"partner_id": pid}).eq("id", row["id"]).execute()
+
         product_id = get_or_create_product(row)
 
         price = row.get("price") or float(row.get("amount", 0)) / 100
         label = row.get("package_name") or "Forfait eSIM"
 
-        # === NOTE ODOO LISIBLES & QR CODE INCLUS ===
         note_html = f"""
         <p><strong>Commande eSIM FENUA SIM</strong></p>
         <p>
@@ -241,7 +242,6 @@ def sync_stripe():
             <img src="{row['qr_code_url']}" width="180"/></p>
             """
 
-        # === CRÉATION SI NOUVELLE COMMANDE ===
         if not order_id:
             order_id = models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD,
@@ -262,7 +262,7 @@ def sync_stripe():
 
 
 # ============================================================
-#  SYNC AIRALO (inchangé)
+#  SYNC AIRALO
 # ============================================================
 
 def sync_airalo():
@@ -305,6 +305,60 @@ def sync_airalo():
 
 
 # ============================================================
+#  SYNC EMAILS
+# ============================================================
+
+def sync_emails():
+    print("📨 Sync emails_sent → Odoo")
+
+    rows = supabase.table("emails_sent").select("*").eq("archived_odoo", False).execute().data or []
+
+    for row in rows:
+        email = row.get("email")
+        name = row.get("customer_name") or ""
+        subject = row.get("subject")
+        html = row.get("html")
+
+        partner_ids = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "res.partner", "search",
+            [[
+                ("email", "=", email),
+                ("name", "ilike", name)
+            ]],
+            {"limit": 1}
+        )
+
+        if not partner_ids:
+            print(f"❌ Aucun client trouvé pour {name} <{email}>")
+            continue
+
+        partner_id = partner_ids[0]
+
+        try:
+            models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                "mail.message", "create",
+                [{
+                    "model": "res.partner",
+                    "res_id": partner_id,
+                    "subject": subject,
+                    "body": html,
+                    "message_type": "comment",
+                    "subtype_id": 1,
+                }]
+            )
+
+            supabase.table("emails_sent").update({"archived_odoo": True}).eq("id", row["id"]).execute()
+            print(f"✅ Archivé dans Odoo : {subject} pour {email}")
+
+        except Exception as e:
+            print(f"❌ Erreur lors de l’archivage Odoo pour {email} :", e)
+
+    print("✅ Emails archivés.")
+
+
+# ============================================================
 #  MAIN
 # ============================================================
 
@@ -313,5 +367,6 @@ if __name__ == "__main__":
 
     sync_airalo()
     sync_stripe()
+    sync_emails()
 
     print("✅ FAST SAAS DONE")
