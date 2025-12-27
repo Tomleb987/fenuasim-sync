@@ -55,7 +55,7 @@ models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object", allow_none=Tru
 # HELPERS
 # ============================================================
 
-def get_tag_id(tag_name):
+def get_tag_id(tag_name: str) -> int:
     """Créer ou récupérer un tag CRM."""
     ids = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
@@ -73,7 +73,7 @@ def get_tag_id(tag_name):
     )
 
 
-def ensure_partner(first_name, last_name, email):
+def ensure_partner(first_name: str, last_name: str, email: str) -> int:
     """Créer ou récupérer un contact."""
     ids = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
@@ -84,24 +84,26 @@ def ensure_partner(first_name, last_name, email):
     if ids:
         return ids[0]
 
-    fullname = f"{first_name} {last_name}".strip()
+    fullname = f"{first_name or ''} {last_name or ''}".strip()
     pid = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
         "res.partner", "create",
         [{
-            "name": fullname,
+            "name": fullname or email,
             "email": email,
         }]
     )
     return pid
 
 
-def ensure_lead(partner_id, first_name, last_name, email):
-    """Créer un lead CRM avec tag."""
-    fullname = f"{first_name} {last_name}".strip()
-    tag_id = get_tag_id("FENUA SIM - Popup -5%")
+def ensure_lead(partner_id: int, first_name: str, last_name: str, email: str) -> int:
+    """Créer un lead CRM (type=lead) avec tag newsletter."""
+    fullname = f"{first_name or ''} {last_name or ''}".strip()
 
-    # Vérifier existence lead
+    # ✅ Tag mis à jour (plus de -5%)
+    tag_id = get_tag_id("FENUA SIM - Popup Newsletter")
+
+    # Vérifier existence lead (évite doublons)
     existing = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
         "crm.lead", "search",
@@ -112,20 +114,20 @@ def ensure_lead(partner_id, first_name, last_name, email):
         print(f"⏭ Déjà synchronisé : {email}")
         return existing[0]
 
-    # --- CORRECTION ICI ---
+    # ✅ Création en LEAD (et non en opportunité)
     lid = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
         "crm.lead", "create",
         [{
-            "name": f"Lead site FENUA SIM - {fullname}",
-            "type": "opportunity",  # <--- AJOUTE CETTE LIGNE POUR PASSER EN OPPORTUNITÉ
-            "contact_name": fullname,
+            "name": f"Lead Newsletter FENUA SIM - {fullname or email}",
+            "type": "lead",  # <--- ICI : lead
+            "contact_name": fullname or email,
             "email_from": email,
             "partner_id": partner_id,
             "tag_ids": [(6, 0, [tag_id])],
         }]
     )
-    print(f"🟢 Opportunité créée → Odoo ID {lid}")
+    print(f"🟢 Lead créé → Odoo ID {lid}")
     return lid
 
 
@@ -137,16 +139,18 @@ def sync_leads():
     print("🚀 SYNC LEADS START")
     print("🚀 Lecture des leads Supabase…")
 
+    # ✅ Filtre : on ne prend que les inscriptions du popup newsletter
     rows = (
         supabase.table("leads")
         .select("*")
+        .eq("source", "popup_newsletter")
         .order("created_at")
         .execute()
         .data
         or []
     )
 
-    print(f"📄 {len(rows)} leads trouvés.")
+    print(f"📄 {len(rows)} leads (popup_newsletter) trouvés.")
 
     for row in rows:
         first = row.get("first_name")
