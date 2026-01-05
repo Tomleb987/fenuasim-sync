@@ -15,9 +15,9 @@ ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
+common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common", allow_none=True)
 uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
-models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object", allow_none=True)
 
 
 # -----------------------------------------
@@ -33,21 +33,40 @@ def normalize_date(val):
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def find_or_create_partner(email, name=None):
+def ensure_partner(row):
+    """
+    AMÉLIORATION : Utilise uniquement first_name et last_name.
+    Stocke l'ID Supabase dans le champ 'ref' d'Odoo.
+    """
+    email = row.get("email", "").strip().lower()
+    if not email:
+        email = "client@fenuasim.com"
+
+    # Recherche par email (insensible à la casse)
     res = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "search_read",
-        [[["email", "=", email]]],
-        {"fields": ["id"], "limit": 1}
+        ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "search",
+        [[["email", "=ilike", email]]],
+        {"limit": 1}
     )
     if res:
-        return res[0]["id"]
+        return res[0]
+
+    # Construction du nom (uniquement first_name et last_name)
+    fname = row.get("first_name") or ""
+    lname = row.get("last_name") or ""
+    fullname = f"{fname} {lname}".strip() or email
 
     pid = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
         "res.partner", "create",
-        [{"name": name or email, "email": email, "customer_rank": 1}]
+        [{
+            "name": fullname,
+            "email": email,
+            "ref": row.get("id"), # ID unique de Supabase
+            "customer_rank": 1
+        }]
     )
-    print(f"👤 Partner créé : {email}")
+    print(f"👤 Partner créé : {fullname} ({email})")
     return pid
 
 
@@ -84,7 +103,7 @@ def confirm_order(order_id):
 
 
 # -----------------------------------------
-# SYNC PRODUITS (même fonction que main_products)
+# SYNC PRODUITS (Retrait de la validité)
 # -----------------------------------------
 def sync_products():
     print("📦 Sync produits Airalo...")
@@ -148,15 +167,23 @@ def sync_airalo_orders():
             continue
 
         product = find_product(package_id)
-        partner = find_or_create_partner(email)
+        if not product: continue
+
+        # On adapte la ligne pour ensure_partner
+        partner_id = ensure_partner({
+            "email": email,
+            "first_name": row.get("prenom"),
+            "last_name": row.get("nom")
+        })
 
         order_id = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             "sale.order", "create",
             [{
-                "partner_id": partner,
+                "partner_id": partner_id,
                 "client_order_ref": order_ref,
                 "date_order": created_at,
+                "origin": "Airalo",
                 "order_line": [
                     (0, 0, {
                         "product_id": product["id"],
@@ -171,23 +198,64 @@ def sync_airalo_orders():
 
 
 # -----------------------------------------
-# SYNC STRIPE PAYMENTS
+# SYNC STRIPE PAYMENTS (Amélioré avec XPF et Promo)
 # -----------------------------------------
 def sync_stripe_payments():
     print("💳 Sync Stripe payments…")
-    rows = supabase.table("orders").select("*").execute().data
+    rows = supabase.table("orders").select("*").eq("status", "completed").execute().data
 
     for row in rows:
-        order_ref = row["order_id"]
-        status = row["status"]
+        order_ref = row["stripe_session_id"] # Utilise stripe_session_id pour la cohérence
+        currency = row.get("currency", "EUR").upper()
+        promo = row.get("promo_code")
 
-        if status != "completed":
-            continue
+        # CORRECTION PRIX XPF 
+        if currency == "XPF":
+            price = float(row.get("amount", 0))
+        else:
+            price = float(row.get("price") or (float(row.get("amount", 0)) / 100))
 
-        odoo_order = find_odoo_order(order_ref)
+        odoo_order_id = find_odoo_order(order_ref)
+        partner_id = ensure_partner(row)
 
-        if odoo_order:
-            confirm_order(odoo_order)
+        # Si la commande n'existe pas, on la crée (plus robuste)
+        if not odoo_order_id:
+            product = find_product(row.get("package_id"))
+            if not product: continue
+
+            # Note SANS validité 
+            note_html = f"""
+            <p><strong>Commande eSIM FENUA SIM</strong></p>
+            <p>
+            <strong>Destination :</strong> {row.get('destination_name', 'N/A')}<br/>
+            <strong>Forfait :</strong> {row.get('package_name', 'eSIM')}<br/>
+            <strong>Données :</strong> {row.get('data_amount')} {row.get('data_unit')}<br/>
+            <strong>Email client :</strong> {row.get('email')}
+            </p>
+            """
+            if promo:
+                note_html += f"<p><strong>Code Promo :</strong> {promo}</p>"
+
+            odoo_order_id = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                "sale.order", "create",
+                [{
+                    "partner_id": partner_id,
+                    "client_order_ref": order_ref,
+                    "origin": "Stripe",
+                    "note": note_html,
+                    "order_line": [
+                        (0, 0, {
+                            "product_id": product["id"],
+                            "name": product["name"],
+                            "product_uom_qty": 1,
+                            "price_unit": price,
+                        })
+                    ],
+                }]
+            )
+
+        confirm_order(odoo_order_id)
 
 
 # -----------------------------------------
