@@ -1,7 +1,6 @@
 import os
-import requests
-from supabase import create_client
 import xmlrpc.client
+from supabase import create_client
 
 # -----------------------------
 # CONFIG
@@ -16,15 +15,41 @@ ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Connexions Odoo
-common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
+common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common", allow_none=True)
 uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
-models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object", allow_none=True)
 
+ESIM_CATEGORY_ID = None
 
 # -----------------------------
-# FONCTION : récupérer le compte 706100
+# HELPERS
 # -----------------------------
+
+def get_or_create_esim_category():
+    """Récupère ou crée la catégorie 'Forfaits eSIM'."""
+    global ESIM_CATEGORY_ID
+    if ESIM_CATEGORY_ID:
+        return ESIM_CATEGORY_ID
+
+    ids = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        "product.category", "search",
+        [[("name", "=", "Forfaits eSIM")]],
+        {"limit": 1}
+    )
+    if ids:
+        ESIM_CATEGORY_ID = ids[0]
+    else:
+        ESIM_CATEGORY_ID = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "product.category", "create",
+            [{"name": "Forfaits eSIM"}]
+        )
+        print("🆕 Catégorie 'Forfaits eSIM' créée.")
+    return ESIM_CATEGORY_ID
+
 def get_esim_income_account():
+    """Récupère le compte comptable 706100."""
     try:
         account = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
@@ -33,74 +58,74 @@ def get_esim_income_account():
             {"fields": ["id"], "limit": 1}
         )
         if account:
-            print(f"✔ Compte 706100 trouvé : ID {account[0]['id']}")
             return account[0]["id"]
-        else:
-            print("⚠ Compte 706100 introuvable, aucun mapping produit possible.")
-            return None
+        print("⚠ Compte 706100 introuvable.")
+        return None
     except Exception as e:
-        print("❌ Erreur lors de la récupération du compte 706100 :", e)
+        print("❌ Erreur récupération compte 706100 :", e)
         return None
 
-
 # -----------------------------
-# FONCTION : synchronisation des produits
+# SYNCHRONISATION DES PRODUITS
 # -----------------------------
 def sync_products():
-    print("🚀 Synchronisation quotidienne des produits Airalo…")
+    print("🚀 Synchronisation des produits Airalo (Optimisée)...")
 
-    # Récupérer toutes les offres Airalo en base
+    # Récupérer les offres Airalo depuis Supabase
     result = supabase.table("airalo_packages").select("*").execute()
     packages = result.data
-
-    print(f"📦 {len(packages)} produits trouvés dans Supabase")
+    print(f"📦 {len(packages)} produits trouvés dans Supabase.")
 
     esim_account_id = get_esim_income_account()
+    categ_id = get_or_create_esim_category()
 
     for pkg in packages:
-
         package_id = pkg["id"]
-        name = pkg["name"]
+        raw_name = pkg["name"]
         region = pkg["region"]
         price = pkg.get("price", 0)
 
-        # Recherche du produit existant dans Odoo
+        # NETTOYAGE : On retire les mentions de validité (ex: "30 jours", "7 days")
+        # On garde le nom de base et la région
+        clean_name = raw_name
+        if region:
+            clean_name = f"{clean_name} [{region}]"
+
+        # Recherche du produit existant
         existing = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
-            "product.product", "search_read",
+            "product.product", "search",
             [[["default_code", "=", package_id]]],
-            {"fields": ["id", "name"], "limit": 1},
+            {"limit": 1},
         )
 
-        # Valeurs communes
         vals = {
-            "name": f"{name} [{region}]" if region else name,
+            "name": clean_name,
             "default_code": package_id,
             "list_price": float(price),
             "type": "service",
             "sale_ok": True,
             "purchase_ok": False,
+            "categ_id": categ_id,
             "property_account_income_id": esim_account_id,
         }
 
         if existing:
-            product_id = existing[0]["id"]
             models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD,
                 "product.product", "write",
-                [[product_id], vals],
+                [[existing[0]], vals],
             )
-            print(f"🔁 Produit mis à jour : {product_id} → {package_id}")
+            print(f"🔁 Mis à jour : {package_id}")
         else:
             product_id = models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD,
                 "product.product", "create",
                 [vals],
             )
-            print(f"✨ Nouveau produit créé : {product_id} → {package_id}")
+            print(f"✨ Créé : {clean_name} ({package_id})")
 
     print("✅ Synchronisation des produits terminée.")
-
 
 # -----------------------------
 # MAIN
