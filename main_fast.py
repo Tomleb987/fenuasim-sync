@@ -1,6 +1,5 @@
 import os
 import sys
-import time
 import xmlrpc.client
 from supabase import create_client, Client
 
@@ -16,9 +15,6 @@ ODOO_DB = os.getenv("ODOO_DB")
 ODOO_USER = os.getenv("ODOO_USER")
 ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
 
-print("[DEBUG] SUPABASE_URL loaded?", bool(SUPABASE_URL), flush=True)
-print("[DEBUG] ODOO_URL loaded?", bool(ODOO_URL), flush=True)
-
 if not SUPABASE_URL or not SUPABASE_KEY:
     print("❌ SUPABASE_URL ou SUPABASE_KEY manquants.", flush=True)
     sys.exit(1)
@@ -32,7 +28,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Connexion Odoo
 common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common", allow_none=True)
 uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
-print("[DEBUG] UID:", uid, flush=True)
+
 if not uid:
     print("❌ Impossible de s'authentifier sur Odoo.", flush=True)
     sys.exit(1)
@@ -50,142 +46,119 @@ def get_or_create_esim_category():
     if ESIM_CATEGORY_ID:
         return ESIM_CATEGORY_ID
 
-    ids = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "product.category", "search",
-        [[("name", "=", "Forfaits eSIM")]],
-        {"limit": 1}
-    )
+    ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.category", "search",
+        [[("name", "=", "Forfaits eSIM")]], {"limit": 1})
+    
     if ids:
         ESIM_CATEGORY_ID = ids[0]
         return ESIM_CATEGORY_ID
 
-    ESIM_CATEGORY_ID = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "product.category", "create",
-        [{"name": "Forfaits eSIM"}]
-    )
-
-    print("🆕 Catégorie : Forfaits eSIM créée.", flush=True)
+    ESIM_CATEGORY_ID = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.category", "create",
+        [{"name": "Forfaits eSIM"}])
     return ESIM_CATEGORY_ID
 
-def ensure_partner(email, first_name=None, last_name=None):
+def ensure_partner(email, first_name=None, last_name=None, supabase_id=None):
+    """
+    Crée ou trouve un partenaire en utilisant uniquement first_name et last_name.
+    L'ID Supabase est stocké dans le champ 'ref' d'Odoo.
+    """
     if not email:
         email = "client@fenuasim.com"
+    
+    email = email.strip().lower()
 
-    ids = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "res.partner", "search",
-        [[("email", "=", email)]],
-        {"limit": 1}
-    )
+    # Recherche par email (insensible à la casse)
+    ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "search",
+        [[("email", "=ilike", email)]], {"limit": 1})
+    
     if ids:
         return ids[0]
 
-    fullname = f"{first_name or ''} {last_name or ''}".strip()
-    if not fullname:
-        fullname = email
+    # Construction du nom (uniquement first_name et last_name)
+    fullname = f"{first_name or ''} {last_name or ''}".strip() or email
 
-    pid = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "res.partner", "create",
-        [{"name": fullname, "email": email}]
-    )
+    pid = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "create", [{
+        "name": fullname,
+        "email": email,
+        "ref": supabase_id, # Référence interne vers Supabase
+        "customer_rank": 1
+    }])
 
-    print(f"🆕 Nouveau client Odoo : {email}", flush=True)
+    print(f"🆕 Nouveau client Odoo : {fullname} ({email})", flush=True)
     return pid
 
 def get_or_create_product(row):
-    package_id = row.get("package_id") or f"ESIM-{row.get('data_amount')}"
-
-    ids = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "product.product", "search",
-        [[("default_code", "=", package_id)]],
-        {"limit": 1}
-    )
+    """
+    Récupère ou crée le produit (sans mention de validité).
+    """
+    package_id = row.get("package_id")
+    ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "search",
+        [[("default_code", "=", package_id)]], {"limit": 1})
+    
     if ids:
         return ids[0]
 
+    # Construction du nom (package_name + data) sans validité
     label_parts = []
     if row.get("package_name"):
         label_parts.append(row["package_name"])
     if row.get("data_amount") and row.get("data_unit"):
         label_parts.append(f"{row['data_amount']} {row['data_unit']}")
-    if row.get("validity"):
-        label_parts.append(f"{row['validity']} jours")
 
     name = " - ".join(label_parts) or "Forfait eSIM"
-    price = row.get("price") or float(row.get("amount", 0)) / 100
+    
+    # Logique de prix corrigée (XPF utilise 'amount' brut)
+    currency = row.get("currency", "EUR").upper()
+    if currency == "XPF":
+        price = float(row.get("amount", 0))
+    else:
+        price = float(row.get("price") or (float(row.get("amount", 0)) / 100))
 
-    pid = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "product.product", "create",
-        [{
-            "name": name,
-            "default_code": package_id,
-            "type": "service",
-            "list_price": price,
-            "categ_id": get_or_create_esim_category(),
-            "taxes_id": [(6, 0, [])],
-        }]
-    )
+    pid = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "product.product", "create", [{
+        "name": name,
+        "default_code": package_id,
+        "type": "service",
+        "list_price": price,
+        "categ_id": get_or_create_esim_category(),
+    }])
 
-    print(f"🆕 Produit créé : {name}", flush=True)
+    print(f"🆕 Produit créé : {name} ({price} {currency})", flush=True)
     return pid
 
 def find_order(stripe_session_id):
-    ids = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "sale.order", "search",
-        [[("client_order_ref", "=", stripe_session_id)]],
-        {"limit": 1}
-    )
+    ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "sale.order", "search",
+        [[("client_order_ref", "=", stripe_session_id)]], {"limit": 1})
     return ids[0] if ids else None
 
 def ensure_order_line(order_id, product_id, price, label):
-    order = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "sale.order", "read",
-        [[order_id], ["order_line"]]
-    )[0]
+    order = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "sale.order", "read",
+        [[order_id], ["order_line"]])[0]
 
-    if order["order_line"]:
-        return
-
-    models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "sale.order", "write",
-        [[order_id], {
-            "order_line": [(0, 0, {
-                "product_id": product_id,
-                "name": label,
-                "product_uom_qty": 1,
-                "price_unit": price
-            })]
-        }]
-    )
+    if not order["order_line"]:
+        models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "sale.order", "write",
+            [[order_id], {
+                "order_line": [(0, 0, {
+                    "product_id": product_id,
+                    "name": label,
+                    "product_uom_qty": 1,
+                    "price_unit": price
+                })]
+            }])
 
 def confirm_order(order_id):
-    order = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "sale.order", "read",
-        [[order_id], ["state"]]
-    )[0]
+    order = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "sale.order", "read",
+        [[order_id], ["state"]])[0]
 
-    if order["state"] in ("sale", "done"):
-        print(f"ℹ️ Commande déjà confirmée : {order_id}", flush=True)
-        return
+    if order["state"] not in ("sale", "done"):
+        try:
+            models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "sale.order", "action_confirm", [[order_id]])
+            print(f"✅ Commande confirmée : {order_id}", flush=True)
+        except Exception as e:
+            print(f"❌ Erreur confirmation {order_id} : {e}", flush=True)
 
-    try:
-        models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            "sale.order", "action_confirm",
-            [[order_id]]
-        )
-        print(f"✅ Commande confirmée : {order_id}", flush=True)
-    except Exception as e:
-        print("❌ Erreur confirmation :", e, flush=True)
+# ============================================================
+#  SYNCHRONISATION
+# ============================================================
 
 def sync_airalo():
     print("🔄 Sync Airalo…", flush=True)
@@ -193,161 +166,90 @@ def sync_airalo():
 
     for row in rows:
         ref = f"AIRALO-{row['order_id']}"
-
-        exists = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            "sale.order", "search",
-            [[("client_order_ref", "=", ref)]],
-            {"limit": 1}
-        )
-        if exists:
-            continue
+        if find_order(ref): continue
 
         pid = ensure_partner(row.get("email"), row.get("prenom"), row.get("nom"))
 
-        note = f"""
-        Commande Airalo<br/>
-        ICCID: {row.get('sim_iccid')}<br/>
-        QR: {row.get('qr_code_url')}<br/>
-        Statut: {row.get('status')}<br/>
-        """
-
-        models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            "sale.order", "create",
-            [{
-                "partner_id": pid,
-                "client_order_ref": ref,
-                "origin": "Airalo",
-                "note": note
-            }]
-        )
-
+        note = f"ICCID: {row.get('sim_iccid')}<br/>QR: {row.get('qr_code_url')}"
+        models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "sale.order", "create", [{
+            "partner_id": pid,
+            "client_order_ref": ref,
+            "origin": "Airalo",
+            "note": note
+        }])
     print("✅ Airalo synchronisé.", flush=True)
 
 def sync_stripe():
     print("💳 Sync Stripe…", flush=True)
-
-    rows = (
-        supabase.table("orders")
-        .select("*")
-        .order("created_at")
-        .execute()
-        .data
-        or []
-    )
-
-    print(f"📄 {len(rows)} lignes Stripe.", flush=True)
+    rows = supabase.table("orders").select("*").eq("status", "completed").order("created_at").execute().data or []
 
     for row in rows:
-        if row.get("status") != "completed":
-            continue
-
         ref = row["stripe_session_id"]
-        print(f"🔎 Stripe session {ref}", flush=True)
+        currency = row.get("currency", "EUR").upper()
+        promo = row.get("promo_code")
+        
+        # Calcul du prix corrigé
+        if currency == "XPF":
+            price = float(row.get("amount", 0))
+        else:
+            price = float(row.get("price") or (float(row.get("amount", 0)) / 100))
 
         order_id = find_order(ref)
-        pid = ensure_partner(row.get("email"), row.get("first_name"), row.get("last_name"))
+        pid = ensure_partner(row.get("email"), row.get("first_name"), row.get("last_name"), row.get("id"))
+        
+        # Mise à jour Supabase avec le partner_id Odoo
         supabase.table("orders").update({"partner_id": pid}).eq("id", row["id"]).execute()
 
         product_id = get_or_create_product(row)
-
-        price = row.get("price") or float(row.get("amount", 0)) / 100
         label = row.get("package_name") or "Forfait eSIM"
 
-        note_html = f"""
-        <p><strong>Commande eSIM FENUA SIM</strong></p>
-        <p>
-        <strong>Destination :</strong> {row.get('destination_name', 'N/A')}<br/>
-        <strong>Forfait :</strong> {row.get('package_name', 'eSIM')}<br/>
-        <strong>Données :</strong> {row.get('data_amount')} {row.get('data_unit')}<br/>
-        <strong>Validité :</strong> {row.get('validity')} jours<br/>
-        <strong>Email client :</strong> {row.get('email')}
-        </p>
-        """
-
-        if row.get("qr_code_url"):
-            note_html += f"""
-            <p><strong>QR Code :</strong><br/>
-            <img src="{row['qr_code_url']}" width="180"/></p>
-            """
-
         if not order_id:
-            order_id = models.execute_kw(
-                ODOO_DB, uid, ODOO_PASSWORD,
-                "sale.order", "create",
-                [{
-                    "partner_id": pid,
-                    "client_order_ref": ref,
-                    "origin": "Stripe",
-                    "note": note_html,
-                }]
-            )
-            print(f"🧾 Nouvelle commande Odoo : {order_id}", flush=True)
+            note_html = f"""
+            <p><strong>Commande eSIM FENUA SIM</strong></p>
+            <p>
+            <strong>Destination :</strong> {row.get('destination_name', 'N/A')}<br/>
+            <strong>Forfait :</strong> {label}<br/>
+            <strong>Données :</strong> {row.get('data_amount')} {row.get('data_unit')}<br/>
+            <strong>Email client :</strong> {row.get('email')}
+            </p>
+            """
+            if promo:
+                note_html += f"<p><strong>Code Promo :</strong> {promo}</p>"
+
+            order_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "sale.order", "create", [{
+                "partner_id": pid,
+                "client_order_ref": ref,
+                "origin": "Stripe",
+                "note": note_html,
+            }])
+            print(f"🧾 Nouvelle commande : {ref}", flush=True)
 
         ensure_order_line(order_id, product_id, price, label)
         confirm_order(order_id)
-
     print("✅ Stripe synchronisé.", flush=True)
 
 def sync_emails():
-    print("📨 Sync emails_sent → Odoo", flush=True)
-
+    print("📨 Sync emails_sent…", flush=True)
     rows = supabase.table("emails_sent").select("*").eq("archived_odoo", False).execute().data or []
-
     for row in rows:
-        email = row.get("email")
-        name = row.get("customer_name") or ""
-        subject = row.get("subject")
-        html = row.get("html")
-
-        partner_ids = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            "res.partner", "search",
-            [[
-                ("email", "=", email),
-                ("name", "ilike", name)
-            ]],
-            {"limit": 1}
-        )
-
-        if not partner_ids:
-            print(f"❌ Aucun client trouvé pour {name} <{email}>", flush=True)
-            continue
-
-        partner_id = partner_ids[0]
-
-        try:
-            models.execute_kw(
-                ODOO_DB, uid, ODOO_PASSWORD,
-                "mail.message", "create",
-                [{
-                    "model": "res.partner",
-                    "res_id": partner_id,
-                    "subject": subject,
-                    "body": html,
-                    "message_type": "comment",
-                    "subtype_id": 1,
-                }]
-            )
-
+        partner_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "search",
+            [[("email", "=", row.get("email"))]], {"limit": 1})
+        
+        if partner_ids:
+            models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "mail.message", "create", [{
+                "model": "res.partner",
+                "res_id": partner_ids[0],
+                "subject": row.get("subject"),
+                "body": row.get("html"),
+                "message_type": "comment",
+                "subtype_id": 1,
+            }])
             supabase.table("emails_sent").update({"archived_odoo": True}).eq("id", row["id"]).execute()
-            print(f"✅ Archivé dans Odoo : {subject} pour {email}", flush=True)
-
-        except Exception as e:
-            print(f"❌ Erreur lors de l’archivage Odoo pour {email} :", e, flush=True)
-
     print("✅ Emails archivés.", flush=True)
-
-# ============================================================
-#  MAIN
-# ============================================================
 
 if __name__ == "__main__":
     print("🚀 SCRIPT DEMARRÉ", flush=True)
-
     sync_airalo()
     sync_stripe()
     sync_emails()
-
     print("✅ SCRIPT TERMINÉ", flush=True)
