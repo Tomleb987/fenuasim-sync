@@ -23,7 +23,6 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common", allow_none=True)
 uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
-
 if not uid:
     print("❌ Impossible de s'authentifier sur Odoo.", flush=True)
     sys.exit(1)
@@ -33,6 +32,9 @@ models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object", allow_none=Tru
 XPF_PER_EUR = 119.33
 ESIM_CATEGORY_ID = None
 
+# -----------------------
+# HELPERS
+# -----------------------
 def get_or_create_esim_category():
     global ESIM_CATEGORY_ID
     if ESIM_CATEGORY_ID:
@@ -54,6 +56,7 @@ def get_or_create_esim_category():
         [{"name": "Forfaits eSIM"}]
     )
     return ESIM_CATEGORY_ID
+
 
 def ensure_partner(email, first_name=None, last_name=None, supabase_id=None):
     if not email:
@@ -83,7 +86,12 @@ def ensure_partner(email, first_name=None, last_name=None, supabase_id=None):
     print(f"🆕 Nouveau client Odoo : {fullname} ({email})", flush=True)
     return pid
 
-def get_or_create_product(row, eur_price_hint: float):
+
+def get_or_create_product(row):
+    """
+    Produit identifié par default_code = package_id.
+    On ne touche pas à list_price ensuite : on facture toujours via price_unit.
+    """
     package_id = row.get("package_id") or "ESIM-UNKNOWN"
 
     ids = models.execute_kw(
@@ -109,12 +117,12 @@ def get_or_create_product(row, eur_price_hint: float):
             "name": name,
             "default_code": package_id,
             "type": "service",
-            "list_price": float(eur_price_hint),  # EUR
             "categ_id": get_or_create_esim_category(),
         }]
     )
-    print(f"🆕 Produit créé : {name} ({float(eur_price_hint):.2f} EUR)", flush=True)
+    print(f"🆕 Produit créé : {name} (code={package_id})", flush=True)
     return pid
+
 
 def find_order(client_order_ref: str):
     ids = models.execute_kw(
@@ -125,45 +133,12 @@ def find_order(client_order_ref: str):
     )
     return ids[0] if ids else None
 
-def add_order_line_if_missing(order_id, product_id, price_eur, label):
-    order = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "sale.order", "read",
-        [[order_id], ["order_line"]]
-    )[0]
 
-    if order["order_line"]:
-        return
-
-    models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "sale.order", "write",
-        [[order_id], {
-            "order_line": [(0, 0, {
-                "product_id": product_id,
-                "name": label,
-                "product_uom_qty": 1,
-                "price_unit": float(price_eur)  # EUR
-            })]
-        }]
-    )
-
-def confirm_order(order_id):
-    order = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "sale.order", "read",
-        [[order_id], ["state"]]
-    )[0]
-
-    if order["state"] not in ("sale", "done"):
-        models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "sale.order", "action_confirm", [[order_id]])
-        print(f"✅ Commande confirmée : {order_id}", flush=True)
-
-def compute_price_eur(row):
+def compute_price_eur(row) -> float:
     """
-    Calcule le montant en EUR à envoyer à Odoo.
-    - EUR: amount est en centimes -> /100
-    - XPF: amount est en XPF -> /119.33
+    EUR à envoyer à Odoo.
+    - EUR: amount en centimes -> /100
+    - XPF: amount en XPF -> /119.33
     """
     currency = (row.get("currency") or "EUR").upper()
     amount = float(row.get("amount") or 0)
@@ -173,12 +148,49 @@ def compute_price_eur(row):
 
     if currency == "EUR":
         return round(amount / 100.0, 2)
+
     if currency == "XPF":
         return round(amount / XPF_PER_EUR, 2)
 
-    # fallback: si un jour tu ajoutes USD etc (à adapter)
     raise Exception(f"Devise non gérée: {currency}")
 
+
+def read_order_amount_total(order_id) -> float:
+    rec = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        "sale.order", "read",
+        [[order_id], ["amount_total"]]
+    )[0]
+    return float(rec.get("amount_total") or 0.0)
+
+
+def confirm_order_if_ok(order_id, expected_total_eur: float):
+    """
+    Confirme seulement si total Odoo est cohérent.
+    Sinon on laisse en devis (évite annulation auto derrière).
+    """
+    total = read_order_amount_total(order_id)
+    if abs(total - float(expected_total_eur)) > 0.05:
+        print(f"⚠️ Pas de confirmation (total Odoo={total:.2f} EUR vs attendu={expected_total_eur:.2f} EUR) order_id={order_id}", flush=True)
+        return
+
+    order = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        "sale.order", "read",
+        [[order_id], ["state"]]
+    )[0]
+
+    if order["state"] not in ("sale", "done"):
+        models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "sale.order", "action_confirm",
+            [[order_id]]
+        )
+        print(f"✅ Commande confirmée : {order_id}", flush=True)
+
+# -----------------------
+# SYNC STRIPE
+# -----------------------
 def sync_stripe():
     print("💳 Sync Stripe…", flush=True)
     rows = supabase.table("orders").select("*").eq("status", "completed").order("created_at").execute().data or []
@@ -188,18 +200,24 @@ def sync_stripe():
         if not ref:
             continue
 
+        # Anti-doublon
         if find_order(ref):
+            continue
+
+        # Conversion EUR robuste
+        try:
+            price_eur = compute_price_eur(row)
+        except Exception as e:
+            print(f"❌ Skip {ref} : {e}", flush=True)
             continue
 
         currency_paid = (row.get("currency") or "EUR").upper()
         amount_paid = row.get("amount")
         promo = row.get("promo_code")
 
-        price_eur = compute_price_eur(row)
-
         pid = ensure_partner(row.get("email"), row.get("first_name"), row.get("last_name"), row.get("id"))
 
-        product_id = get_or_create_product(row, eur_price_hint=price_eur)
+        product_id = get_or_create_product(row)
         label = row.get("package_name") or "Forfait eSIM"
 
         note_html = f"""
@@ -216,6 +234,8 @@ def sync_stripe():
         if promo:
             note_html += f"<p><strong>Code Promo :</strong> {promo}</p>"
 
+        # ✅ IMPORTANT : créer la commande AVEC la ligne directement
+        # -> évite recalculs/updates post-create qui déclenchent des règles côté Odoo
         order_id = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             "sale.order", "create",
@@ -224,15 +244,22 @@ def sync_stripe():
                 "client_order_ref": ref,
                 "origin": "Stripe",
                 "note": note_html,
+                "order_line": [(0, 0, {
+                    "product_id": product_id,
+                    "name": label,
+                    "product_uom_qty": 1,
+                    "price_unit": float(price_eur),  # EUR only
+                })]
             }]
         )
 
-        add_order_line_if_missing(order_id, product_id, price_eur, label)
-        confirm_order(order_id)
+        print(f"🧾 Créée {ref} -> {price_eur:.2f} EUR (payé {amount_paid} {currency_paid}) order_id={order_id}", flush=True)
 
-        print(f"🧾 OK {ref} -> {price_eur:.2f} EUR (payé {amount_paid} {currency_paid})", flush=True)
+        # ✅ Confirmer uniquement si total OK
+        confirm_order_if_ok(order_id, expected_total_eur=price_eur)
 
     print("✅ Stripe synchronisé.", flush=True)
+
 
 if __name__ == "__main__":
     print("🚀 SCRIPT DEMARRÉ", flush=True)
